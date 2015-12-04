@@ -966,7 +966,7 @@ static ngx_int_t mp4_parse_atom(mp4_file_t *mp4f, mp4_atom_t *atom)
 	/*else if (atom->hdr->type == ATOM('s', 't', 't', 's'))
 		mp4f->stts = (mp4_atom_stts_t *)atom->hdr;*/
 
-	for (i = 0; i < sizeof(mp4_atom_containers); i++) {
+	for (i = 0; i < sizeof(mp4_atom_containers)/sizeof(mp4_atom_containers[0]); i++) {
 		if (atom->hdr->type == mp4_atom_containers[i])
 			goto found;
 	}
