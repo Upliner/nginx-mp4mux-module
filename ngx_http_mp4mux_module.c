@@ -196,7 +196,7 @@ typedef struct {
 	off_t file_size;
 	off_t mdat_pos;
 	off_t mdat_size;
-	off_t mdat_recv;
+	ngx_uint_t mdat_recv;
 	
 	//off_t chunk_pos;
 	ngx_uint_t *chunk_size;
@@ -282,8 +282,10 @@ static void mp4_split(mp4_file_t *mp4f);
 static ngx_int_t mp4_adjust_pos(mp4_file_t *mp4f, mp4_atom_t *trak, uint64_t start);
 static int mp4mux_write(ngx_http_mp4mux_ctx_t *ctx);
 static void ngx_http_mp4mux_write_handler(ngx_event_t *ev);
+#if (NGX_HTTP_CPROXY)
 static ngx_int_t mp4mux_cproxy_handler_header(ngx_http_request_t *req, ngx_chain_t *out, u_char *last, void *arg);
 static ngx_int_t mp4mux_cproxy_handler_mdat(ngx_http_request_t *req, ngx_chain_t *out, u_char *last, void *arg);
+#endif
 static ngx_int_t mp4mux_send_response(ngx_http_mp4mux_ctx_t *ctx);
 static void mp4mux_cleanup(void *data);
 
@@ -352,13 +354,10 @@ ngx_http_mp4mux_handler(ngx_http_request_t *r)
     ngx_int_t                  rc, n;
     ngx_uint_t                 i;
     ngx_str_t                  path, value;
-    //ngx_buf_t                 *b;
-    //ngx_chain_t                out[MAX_FILE];
-    //ngx_http_core_loc_conf_t  *clcf;
 		ngx_http_mp4mux_ctx_t *ctx;
 		u_char argname[10];
 		ngx_str_t fname;
-    ngx_http_mp4mux_conf_t   *conf;
+		ngx_http_mp4mux_conf_t   *conf;
 		ngx_http_cleanup_t *cln;
     ngx_log_t *log = r->connection->log;
 		ngx_connection_t *c = r->connection;
@@ -375,13 +374,6 @@ ngx_http_mp4mux_handler(ngx_http_request_t *r)
         return NGX_DECLINED;
 		}
 
-    //clcf = ngx_http_get_module_loc_conf(r, ngx_http_core_module);
-		/*if (!clcf->sendfile) {
-			ngx_log_error(NGX_LOG_ALERT, log, 0, "mp4mux: sendfile is not enabled in current location");
-      return NGX_DECLINED;
-	}
-		}*/
-
     rc = ngx_http_discard_request_body(r);
 
     if (rc != NGX_OK) {
@@ -397,17 +389,14 @@ ngx_http_mp4mux_handler(ngx_http_request_t *r)
 
     path.len = last - path.data;
 
-
     ctx = ngx_pcalloc(r->pool, sizeof(ngx_http_mp4mux_ctx_t));
-    
+
 		if (ctx == NULL) {
         return NGX_HTTP_INTERNAL_SERVER_ERROR;
     }
-				
-		//ctx->mp4f.log = log;
-		//ctx->mp4f.pool = r->pool;
+
 		ctx->req = r;
-      
+
     ngx_http_set_ctx(r, ctx, ngx_http_mp4mux_module);
 
 		ctx->temp_pool = ngx_create_pool(16384, log);
@@ -617,7 +606,7 @@ static ngx_int_t mp4mux_open_file(ngx_http_mp4mux_ctx_t *ctx, mp4_file_t *f)
 static ngx_int_t mp4mux_send_response(ngx_http_mp4mux_ctx_t *ctx)
 {
 		off_t total_mdat = 0;
-		off_t offset, stco_val;
+		off_t offset;
 		mp4_atom_t *trak[MAX_FILE];
 		mp4_atom_stco_t *stco[MAX_FILE];
 		ngx_chain_t   *out;
@@ -625,13 +614,10 @@ static ngx_int_t mp4mux_send_response(ngx_http_mp4mux_ctx_t *ctx)
     off_t len, len_tail;
     ngx_log_t *log = ctx->req->connection->log;
 		ngx_http_request_t *r = ctx->req;
-    ngx_http_mp4mux_conf_t   *conf;
     ngx_uint_t chunk_num, sc;
-		ngx_uint_t total_samples, min_samples = INT_MAX;
+		ngx_uint_t total_samples = 0, min_samples = INT_MAX;
 		double corr;
 		
-    conf = ngx_http_get_module_loc_conf(r, ngx_http_mp4mux_module);
-
 		for (n = 0; ctx->mp4_src[n]; n++) {
 			rc = mp4mux_open_file(ctx, ctx->mp4_src[n]);
 			if (rc != NGX_OK)
@@ -1417,7 +1403,7 @@ static mp4_atom_stco_t *mp4_alloc_chunks(mp4_file_t *mp4f, mp4_atom_t *trak, mp4
 	mp4_atom_t *stbl, *a;
 	mp4_atom_stsc_t *stsc;
 	mp4_atom_stco_t *stco;
-	uint32_t *ptr, *ptr2;
+	uint32_t *ptr;
 	ngx_uint_t stco_cnt = 0, stsc_cnt = 0;
 	ngx_uint_t i, n;
 	ngx_uint_t cnt, chunk, s_cnt;
