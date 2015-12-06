@@ -194,6 +194,7 @@ typedef struct {
 	mp4_atom_t *stbl;
 
 	off_t file_size;
+	time_t file_mtime;
 	off_t mdat_pos;
 	off_t mdat_size;
 	ngx_uint_t mdat_recv;
@@ -410,6 +411,7 @@ ngx_http_mp4mux_handler(ngx_http_request_t *r)
 		cln->handler = mp4mux_cleanup;
 		cln->data = ctx;
 
+
 		for (i = 0, n = 0; i < r->args.len && i < MAX_FILE; i++) {
 			ngx_memzero(argname, 10);
 			ngx_sprintf(argname, "file%i", i);
@@ -594,6 +596,7 @@ static ngx_int_t mp4mux_open_file(ngx_http_mp4mux_ctx_t *ctx, mp4_file_t *f)
 	}
 
 	f->file_size = of.size;
+	f->file_mtime = of.mtime;
 	f->file.fd = of.fd;
 	f->file.name = f->fname;
 	f->file.log = ctx->req->connection->log;
@@ -616,12 +619,15 @@ static ngx_int_t mp4mux_send_response(ngx_http_mp4mux_ctx_t *ctx)
 		ngx_http_request_t *r = ctx->req;
     ngx_uint_t chunk_num, sc;
 		ngx_uint_t total_samples = 0, min_samples = INT_MAX;
+		ngx_table_elt_t *etag;
+		u_char *etag_val;
 		double corr;
 		
 		for (n = 0; ctx->mp4_src[n]; n++) {
 			rc = mp4mux_open_file(ctx, ctx->mp4_src[n]);
 			if (rc != NGX_OK)
 				goto out_err;
+
 
 #if (NGX_HTTP_CPROXY)
 			if (ctx->mp4_src[n]->remote) {
@@ -751,10 +757,33 @@ static ngx_int_t mp4mux_send_response(ngx_http_mp4mux_ctx_t *ctx)
     r->headers_out.status = NGX_HTTP_OK;
     r->headers_out.content_length_n = offset + len_tail;
     //r->headers_out.last_modified_time = ;
+		ngx_str_set(&r->headers_out.content_type, "video/mp4");
+		r->headers_out.content_type_len = r->headers_out.content_type.len;
+		// Calculate ETag
+		etag = ngx_list_push(&r->headers_out.headers);
+		if (etag == NULL) goto out_err1;
 
-    if (ngx_http_set_content_type(r) != NGX_OK)
-        goto out_err1;
-	
+		etag->hash = 1;
+		ngx_str_set(&etag->key, "ETag");
+
+		etag_val = ngx_pnalloc(r->pool, (NGX_OFF_T_LEN + NGX_TIME_T_LEN + 2)*n + 2);
+		if (etag_val == NULL) {
+			etag->hash = 0;
+			goto out_err1;
+		}
+		etag->value.data = etag_val;
+
+		*etag_val++ = '"';
+		for (i = 0; i < n; i++) {
+			if (i) *etag_val++ = '/';
+			etag_val = ngx_sprintf(etag_val, "%xT-%xO",
+				ctx->mp4_src[i]->file_mtime,
+				ctx->mp4_src[i]->file_size);
+		}
+		*etag_val++ = '"';
+		etag->value.len = etag_val - etag->value.data;
+		r->headers_out.etag = etag;
+
 		rc = ngx_http_send_header(r);
 		if (rc == NGX_ERROR || rc > NGX_OK || r->header_only)
 				goto out_err;
