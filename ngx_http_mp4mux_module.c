@@ -171,7 +171,6 @@ typedef struct {
 
 	ngx_str_t url;
 	ngx_str_t fname;
-	void *cproxy_ctx;
 
 	mp4_atom_t *moov;
 	mp4_atom_t *trak;
@@ -521,15 +520,6 @@ static ngx_int_t mp4mux_send_response(ngx_http_mp4mux_ctx_t *ctx)
 		rc = mp4mux_open_file(ctx, ctx->mp4_src[n]);
 		if (rc != NGX_OK)
 			goto out_err;
-
-
-#if (NGX_HTTP_CPROXY)
-		if (ctx->mp4_src[n]->remote) {
-			rc = ngx_http_cproxy_request(r, &ctx->mp4_src[n]->url, &ctx->mp4_src[n]->fname, ctx->mp4_src[n]->file_size, ctx->mp4_src[n]->mdat_pos, CPROXY_OPT_OFFSET | CPROXY_OPT_SENDFILE | CPROXY_OPT_SYNC, mp4mux_cproxy_handler_mdat, ctx->mp4_src[n], &ctx->mp4_src[n]->cproxy_ctx);
-			if (rc != NGX_OK)
-				goto out_err;
-		}
-#endif
 	}
 
 	if (mp4_clone(ctx->mp4_src[0], &ctx->mp4f))
@@ -864,59 +854,54 @@ static ngx_int_t mp4_parse_atom(mp4_file_t *mp4f, mp4_atom_t *atom)
 	atom_name[4] = 0;
 
 	if (atom->hdr->type == ATOM('t', 'r', 'a', 'k'))
-	mp4f->trak = atom;
+		mp4f->trak = atom;
 	else if (atom->hdr->type == ATOM('s', 't', 's', 'z'))
-	mp4f->stsz = (mp4_atom_stsz_t *)atom->hdr;
+		mp4f->stsz = (mp4_atom_stsz_t *)atom->hdr;
 	else if (atom->hdr->type == ATOM('s', 't', 's', 'c'))
-	mp4f->stsc = (mp4_atom_stsc_t *)atom->hdr;
+		mp4f->stsc = (mp4_atom_stsc_t *)atom->hdr;
 	else if (atom->hdr->type == ATOM('m', 'v', 'h', 'd'))
-	mp4f->mvhd = (mp4_atom_mvhd_t *)atom->hdr;
+		mp4f->mvhd = (mp4_atom_mvhd_t *)atom->hdr;
 
-	for (i = 0; i < sizeof(mp4_atom_containers)/sizeof(mp4_atom_containers[0]); i++) {
-		if (atom->hdr->type == mp4_atom_containers[i])
-			goto found;
-	}
+	for (i = 0; i < sizeof(mp4_atom_containers)/sizeof(mp4_atom_containers[0]); i++)
+		if (atom->hdr->type == mp4_atom_containers[i]) {
+			atom_size = be32toh(atom->hdr->size) - sizeof(*hdr);
+			for (pos = 0; pos < atom_size; pos += size) {
+				hdr = (mp4_atom_hdr_t *)(atom->hdr->data + pos);
+				size = be32toh(hdr->size);
 
-	return 0;
+				ngx_memcpy(atom_name, &hdr->type, 4);
+				ngx_log_debug2(NGX_LOG_DEBUG_HTTP, mp4f->log, 0,
+					"begin atom: %s %i", atom_name, size);
 
-found:
-	atom_size = be32toh(atom->hdr->size) - sizeof(*hdr);
-	for (pos = 0; pos < atom_size; pos += size) {
-		hdr = (mp4_atom_hdr_t *)(atom->hdr->data + pos);
-		size = be32toh(hdr->size);
+				if (size < 8) {
+					ngx_log_error(NGX_LOG_ERR, mp4f->log, 0,
+						"mp4mux: \"%V\": atom is too small:%uL",
+						&mp4f->fname, size);
+					return -1;
+				}
 
-		ngx_memcpy(atom_name, &hdr->type, 4);
-		ngx_log_debug2(NGX_LOG_DEBUG_HTTP, mp4f->log, 0,
-			"begin atom: %s %i", atom_name, size);
+				if (hdr->type == ATOM('e', 'd', 't', 's'))
+					continue;
 
-		if (size < 8) {
-			ngx_log_error(NGX_LOG_ERR, mp4f->log, 0,
-				"mp4mux: \"%V\": atom is too small:%uL",
-				&mp4f->fname, size);
-			return -1;
+				a = ngx_pcalloc(mp4f->pool, sizeof(*a));
+				if (!a)
+					return -1;
+
+				ngx_memcpy(&a->hdr, hdr, sizeof(*hdr));
+
+				MP4MUX_INIT_LIST_HEAD(&a->atoms);
+				a->parent = atom;
+				a->hdr = hdr;
+				mp4mux_list_add_tail(&a->entry, &atom->atoms);
+
+				if (mp4_parse_atom(mp4f, a))
+					return -1;
+
+				ngx_log_debug2(NGX_LOG_DEBUG_HTTP, mp4f->log, 0,
+					"end atom: %s %i", atom_name, size);
+			}
+			return 0;
 		}
-
-		if (hdr->type == ATOM('e', 'd', 't', 's'))
-			continue;
-
-		a = ngx_pcalloc(mp4f->pool, sizeof(*a));
-		if (!a)
-			return -1;
-
-		ngx_memcpy(&a->hdr, hdr, sizeof(*hdr));
-
-		MP4MUX_INIT_LIST_HEAD(&a->atoms);
-		a->parent = atom;
-		a->hdr = hdr;
-		mp4mux_list_add_tail(&a->entry, &atom->atoms);
-
-		if (mp4_parse_atom(mp4f, a))
-			return -1;
-
-		ngx_log_debug2(NGX_LOG_DEBUG_HTTP, mp4f->log, 0,
-			"end atom: %s %i", atom_name, size);
-	}
-
 	return 0;
 }
 
