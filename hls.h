@@ -6,9 +6,8 @@
 #define MPEGTS_PACKET_USABLE_SIZE (MPEGTS_PACKET_SIZE - SIZEOF_MPEGTS_HEADER)
 #define HLS_DELAY (63000)			// 700 ms PCR delay
 #define INITIAL_DTS (9090)
-#define INITIAL_PCR (-4500)
+#define INITIAL_PCR (4590)
 #define HLS_TIMESCALE (90000)
-#define PCR_TIMESCALE (27000000)
 
 
 #define out2b(p,a,b) *p++ = a; *p++ = b;
