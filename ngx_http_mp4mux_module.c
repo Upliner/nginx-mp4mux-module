@@ -1650,7 +1650,7 @@ static ngx_int_t mp4mux_hls_write(ngx_http_mp4mux_ctx_t *ctx)
 			case PES_AUDIO:
 				*(uint32_t*)adts_hdr = mp4->hls_ctx->adts_hdr;
 				adts_hdr[6] = 0xfc;
-				for (j = 0; j < 9; j++) {
+				for (j = 1; j < 16 && mp4->hls_ctx->dts-dts < HLS_MAX_DELAY;) {
 					if (len >= 8192) {
 						ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
 							"audio frame is too long: %i", len);
@@ -1667,6 +1667,7 @@ static ngx_int_t mp4mux_hls_write(ngx_http_mp4mux_ctx_t *ctx)
 							b->last = p_end;
 							if ((b = mp4mux_hls_newpacket(b, ctx)) == NULL)
 								return NGX_HTTP_INTERNAL_SERVER_ERROR;
+							j++;
 							p = b->last;
 							p_end = p + MPEGTS_PACKET_SIZE;
 							out4b(p, 0x47, 0x01, ctx->cur_trak, 0x10 + mp4->hls_ctx->cocnt++)
@@ -1699,8 +1700,6 @@ static ngx_int_t mp4mux_hls_write(ngx_http_mp4mux_ctx_t *ctx)
 					if (mp4->hls_ctx->eof) break;
 					len = be32toh(mp4->stsz->tbl[mp4->hls_ctx->frame_no]);
 					frame_end = offs + len;
-					if (pes_len + len > 65528)
-						break;
 				}
 
 				break;
@@ -1714,7 +1713,22 @@ static ngx_int_t mp4mux_hls_write(ngx_http_mp4mux_ctx_t *ctx)
 				*len_field = 0;
 			else
 				*len_field = htobe16(pes_len);
-			ngx_memset(p, 0xff, p_end - p);
+			if (pes_len == 0 || (mp4->hls_ctx->pes_typ == PES_AUDIO && pes_len > 174)) {
+				// stuff packet
+				if (p != p_end) {
+					len = p-(p_end-MPEGTS_PACKET_USABLE_SIZE);
+					ngx_memmove(p_end-len, p-len, len);
+					p = p_end - MPEGTS_PACKET_SIZE + 3;
+					*p++ |= 0x20;
+					len = MPEGTS_PACKET_USABLE_SIZE-len-1;
+					*p++ = len;
+					if (len > 0) {
+						*p++ = 0;
+						ngx_memset(p, 0xff, --len);
+					}
+				}
+			} else
+				ngx_memset(p, 0xff, p_end - p);
 			b->last = p_end;
 
 			if (ctx->dts < mp4->hls_ctx->dts)
