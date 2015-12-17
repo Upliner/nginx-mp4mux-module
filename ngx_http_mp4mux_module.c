@@ -237,7 +237,6 @@ typedef struct {
 	u_char pes_typ;
 	u_char sf_len;         // Length of mp4 subframe size field
 
-	mp4_atom_mdhd_t *mdhd;
 	mp4_atom_stts_t *stts;
 	mp4_atom_ctts_t *ctts;
 	mp4_atom_stss_t *stss;
@@ -249,6 +248,7 @@ typedef struct {
 	bool_t co64;
 	uint32_t frame_no;
 	uint32_t sample_no;
+	uint32_t timescale;
 	uint32_t dts;
 	uint32_t sample_max;
 	off_t frame_offs;
@@ -1185,8 +1185,7 @@ static ngx_int_t mp4mux_hls_parse_stsd_audio(ngx_log_t *log, mp4_hls_ctx_t *hls_
 }
 
 static void hls_calcdts(mp4_hls_ctx_t *hls_ctx) {
-	uint32_t scale = be32toh(hls_ctx->mdhd->timescale);
-	hls_ctx->dts = ((int64_t)hls_ctx->sample_no * HLS_TIMESCALE + scale/2) / scale;
+	hls_ctx->dts = ((int64_t)hls_ctx->sample_no * HLS_TIMESCALE + hls_ctx->timescale/2) / hls_ctx->timescale;
 }
 // Advances stts, frame_no and sample_no but not ctts, stsc and dts
 static ngx_int_t hls_nextframe_base(mp4_file_t *mp4) {
@@ -1426,12 +1425,12 @@ static ngx_int_t mp4mux_hls_send_segment(ngx_http_mp4mux_ctx_t *ctx)
 			ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
 				"mp4mux: no mdhd atom found in %V", &ctx->mp4_src[n]->fname);
 			return NGX_HTTP_NOT_FOUND;
-		} else
-			hls_ctx->mdhd = (mp4_atom_mdhd_t*)atom->hdr;
+		}
+		hls_ctx->timescale = be32toh(((mp4_atom_mdhd_t*)atom->hdr)->timescale);
 
 		// Move to segment start
 		if (ctx->hls_seg > 1) {
-			sample_start = (ctx->hls_seg - 1) * ctx->segment_ms * be32toh(hls_ctx->mdhd->timescale) / 1000;
+			sample_start = (ctx->hls_seg - 1) * ctx->segment_ms * hls_ctx->timescale / 1000;
 
 			while (sample_start > 0) {
 				i = hls_ctx->stts_ptr.value * hls_ctx->stts_ptr.samp_left;
@@ -1472,7 +1471,7 @@ static ngx_int_t mp4mux_hls_send_segment(ngx_http_mp4mux_ctx_t *ctx)
 			return NGX_HTTP_NOT_FOUND;
 		}
 
-		hls_ctx->sample_max = ctx->hls_seg * ctx->segment_ms * be32toh(hls_ctx->mdhd->timescale) / 1000;
+		hls_ctx->sample_max = ctx->hls_seg * ctx->segment_ms * hls_ctx->timescale / 1000;
 		if (hls_ctx->eof) continue;
 		hls_ctx->frame_offs += hls_ctx->co64 ?
 			be64toh(hls_ctx->co->u.tbl64[hls_ctx->stsc_ptr.value-1])
@@ -1497,7 +1496,6 @@ static ngx_int_t mp4mux_hls_send_segment(ngx_http_mp4mux_ctx_t *ctx)
 
 	return mp4mux_hls_write(ctx);
 }
-
 
 static ngx_buf_t *hls_newbuf(ngx_http_mp4mux_ctx_t *ctx) {
 	ngx_chain_t *chain;
@@ -1555,6 +1553,7 @@ static ngx_int_t hls_nextframe(mp4_file_t *mp4)
 	rc = hls_nextframe_base(mp4);
 	if (rc != NGX_OK)
 		return rc;
+	if (mp4->hls_ctx->eof) return NGX_OK;
 	uint32_t curchunk = mp4->hls_ctx->stsc_ptr.value;
 	if (mp4->hls_ctx->ctts && ((mp4_stbl_ptr_advance(&mp4->hls_ctx->ctts_ptr, &mp4->hls_ctx->ctts->hdr)) != NGX_OK)) {
 		ngx_log_error(NGX_LOG_ERR, mp4->log, 0,
@@ -1599,8 +1598,7 @@ static ngx_int_t mp4mux_hls_write(ngx_http_mp4mux_ctx_t *ctx)
 	ngx_int_t rc, i;
 	ngx_int_t pes_len, len;
 	uint32_t sf_len = 0;
-	// mp4 subframe length field is variable-length, so we need to read to different location depending on it
-	u_char *sf_len_ptr;
+	u_char *sf_len_ptr; // mp4 subframe length field is variable-length, so we need to read to different location depending on it
 	bool_t keyframe = 1;
 	uint32_t dts;
 	u_char adts_hdr[SIZEOF_ADTS_HEADER];
@@ -1653,8 +1651,8 @@ static ngx_int_t mp4mux_hls_write(ngx_http_mp4mux_ctx_t *ctx)
 			if (mp4->hls_ctx->ctts) {
 				pes_len += 10;
 				out2b(p, 0xc0, 10);
-				p = write_pts(p, 3, ((int64_t)mp4->hls_ctx->sample_no + mp4->hls_ctx->ctts_ptr.value)
-					* HLS_TIMESCALE / be32toh(mp4->hls_ctx->mdhd->timescale) + INITIAL_DTS);
+				p = write_pts(p, 3, ((int64_t)mp4->hls_ctx->sample_no + mp4->hls_ctx->ctts_ptr.value + mp4->hls_ctx->timescale / 2)
+					* HLS_TIMESCALE / mp4->hls_ctx->timescale + INITIAL_DTS);
 			} else {
 				pes_len += 5;
 				out2b(p, 0x80, 5);
