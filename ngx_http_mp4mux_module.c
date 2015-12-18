@@ -446,38 +446,32 @@ ngx_http_mp4mux_handler(ngx_http_request_t *r)
 	ngx_http_mp4mux_conf_t   *conf;
 	ngx_log_t *log = r->connection->log;
 
-	log = r->connection->log;
 	ngx_log_debug0(NGX_LOG_DEBUG_HTTP, log, 0,
 		"http_mp4mux_handler");
 
-	if (!(r->method & (NGX_HTTP_GET|NGX_HTTP_HEAD))) {
+	if (!(r->method & (NGX_HTTP_GET|NGX_HTTP_HEAD)))
 		return NGX_HTTP_NOT_ALLOWED;
-	}
 
-	if (!r->args.len) {
-		return NGX_DECLINED;
-	}
+	if (!r->args.len)
+		return NGX_HTTP_NOT_FOUND;
 
 	rc = ngx_http_discard_request_body(r);
 
-	if (rc != NGX_OK) {
+	if (rc != NGX_OK)
 		return rc;
-	}
 
 	conf = ngx_http_get_module_loc_conf(r, ngx_http_mp4mux_module);
 
 	last = ngx_http_map_uri_to_path(r, &path, &root, 0);
-	if (last == NULL) {
+	if (last == NULL)
 		return NGX_HTTP_INTERNAL_SERVER_ERROR;
-	}
 
 	path.len = last - path.data;
 
 	ctx = ngx_pcalloc(r->pool, sizeof(ngx_http_mp4mux_ctx_t));
 
-	if (ctx == NULL) {
+	if (ctx == NULL)
 		return NGX_HTTP_INTERNAL_SERVER_ERROR;
-	}
 
 	ctx->req = r;
 
@@ -1073,7 +1067,9 @@ static ngx_int_t mp4mux_hls_parse_stsd_video(ngx_http_mp4mux_ctx_t *ctx, mp4_hls
 			"mp4mux: number of entries in stsd must be 1");
 		return NGX_ERROR;
 	}
-	if (stsd->entry.hdr.type != ATOM('a','v','c','1')) {
+	if (stsd->entry.hdr.type != ATOM('a','v','c','1')
+		&& stsd->entry.hdr.type != ATOM('h','2','6','4')
+		&& stsd->entry.hdr.type != ATOM('H','2','6','4')) {
 		ngx_log_error(NGX_LOG_ERR, ctx->req->connection->log, 0,
 			"mp4mux: only avc1 format is supported now");
 		return NGX_ERROR;
