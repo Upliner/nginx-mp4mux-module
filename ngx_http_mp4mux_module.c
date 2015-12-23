@@ -2234,6 +2234,13 @@ static ngx_int_t mp4mux_hls_write(ngx_http_mp4mux_ctx_t *ctx)
 							"audio frame is too long: %i", len);
 						return NGX_HTTP_INTERNAL_SERVER_ERROR;
 					}
+					if (p == p_end) {
+						b->last = p;
+						if ((b = hls_newpacket(b, ctx, mp4->hls_ctx, TS_TYP1_CONTINUE, TS_TYP2_PAYLD)) == NULL)
+							return NGX_HTTP_INTERNAL_SERVER_ERROR;
+						p = b->last;
+						p_end = p + MPEGTS_PACKET_USABLE_SIZE;
+					}
 					ngx_log_debug3(NGX_LOG_DEBUG_HTTP, ctx->req->connection->log, 0,
 						"mp4mux: audio frame %i, len: %i, frame_end = %i", mp4->hls_ctx->frame_no, len, frame_end);
 					adts_hdr[3] &= 0xfc;
@@ -2252,7 +2259,7 @@ static ngx_int_t mp4mux_hls_write(ngx_http_mp4mux_ctx_t *ctx)
 					}
 					pes_len += len;
 					len = (p_end - p);
-					while (len < frame_end && mp4->offs <= frame_end - len) {
+					while (len < frame_end && mp4->offs < frame_end - len) {
 						if (mp4mux_read(mp4, p, len, 1) != NGX_OK)
 							return NGX_OK;
 						b->last = p_end;
@@ -2266,7 +2273,6 @@ static ngx_int_t mp4mux_hls_write(ngx_http_mp4mux_ctx_t *ctx)
 					if (mp4mux_read(mp4, p, len, 1) != NGX_OK)
 						return NGX_OK;
 					p += len;
-					mp4->offs = frame_end;
 					// Move to the next frame
 					mp4->hls_ctx->frame_offs = frame_end;
 					rc = hls_nextframe(mp4);
@@ -2363,6 +2369,7 @@ static ngx_int_t mp4mux_hls_write(ngx_http_mp4mux_ctx_t *ctx)
 		if (ctx->done) {
 			ngx_log_debug1(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
 				"mp4mux: DONE! rc = %i", rc);
+			return rc;
 		}
 		if (rc != NGX_OK) {
 			mp4mux_handle_write_rc(r, rc);
@@ -2495,7 +2502,7 @@ static void ngx_http_mp4mux_write_handler(ngx_event_t *ev)
 	if (c->destroyed || r->done || ctx->done) {
 		r->blocked--;
 		ev->handler = ctx->write_handler;
-	    return;
+		return;
 	}
 
 	if (!r->out || !r->out->next) {
