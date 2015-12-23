@@ -2145,8 +2145,8 @@ static ngx_int_t mp4mux_hls_write(ngx_http_mp4mux_ctx_t *ctx)
 			if (mp4->hls_ctx->ctts) {
 				pes_len = 13;
 				out2b(p, 0xc0, 10);
-				p = write_pts(p, 3, ((int64_t)mp4->hls_ctx->sample_no + mp4->hls_ctx->ctts_ptr.value + mp4->hls_ctx->timescale / 2)
-					* HLS_TIMESCALE / mp4->hls_ctx->timescale + INITIAL_DTS);
+				p = write_pts(p, 3, (((int64_t)mp4->hls_ctx->sample_no + mp4->hls_ctx->ctts_ptr.value)
+					* HLS_TIMESCALE + mp4->hls_ctx->timescale / 2) / mp4->hls_ctx->timescale + INITIAL_DTS);
 			} else {
 				pes_len = 8;
 				out2b(p, 0x80, 5);
@@ -2376,12 +2376,15 @@ static ngx_int_t mp4mux_hls_write(ngx_http_mp4mux_ctx_t *ctx)
 			ngx_log_debug1(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
 				"mp4mux_hls_write(): ngx_http_output_filter() failed, rc = %i", rc);
 			return rc;
+		} else if (rc == NGX_AGAIN) {
+			ngx_log_debug1(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
+				"mp4mux_hls_write(): ngx_http_output_filter() returned NGX_AGAIN", rc);
 		}
 		if (ctx->done) {
 			ngx_log_debug1(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
 				"mp4mux: DONE! rc = %i", rc);
 			ctx->done = 1;
-			return rc;
+			return NGX_OK;
 		}
 		ctx->chain = ctx->chain_last;
 	}
@@ -2533,6 +2536,9 @@ static ngx_int_t mp4_parse_atom(mp4_file_t *mp4f, mp4_atom_t *atom)
 						&mp4f->fname, size);
 					return -1;
 				}
+
+				if (hdr->type == ATOM('e', 'd', 't', 's'))
+					continue;
 
 				a = ngx_pcalloc(mp4f->pool, sizeof(*a));
 				if (!a)
