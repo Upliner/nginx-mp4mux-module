@@ -1291,8 +1291,8 @@ static ngx_int_t mp4mux_hls_send_index(ngx_http_mp4mux_ctx_t *ctx)
 	ngx_http_core_srv_conf_t *cscf;
 	ngx_http_request_t *r = ctx->req;
 	ngx_table_elt_t *content_disp;
-	ngx_int_t rc, i, n, len, rem;
-	ngx_int_t longest_track = 0;
+	ngx_int_t rc, i, n, rem;
+	size_t longest_track = 0, len;
 	ngx_str_t host = ngx_null_string, uri;
 	u_char *match, *match_end;
 	ngx_buf_t *buf;
@@ -1333,7 +1333,7 @@ static ngx_int_t mp4mux_hls_send_index(ngx_http_mp4mux_ctx_t *ctx)
 
 	// Find longest mp4 file
 	for (i = 0; ctx->mp4_src[i]; i++) {
-		len = be32toh(ctx->mp4_src[i]->mvhd->duration) * 1000 / be32toh(ctx->mp4_src[i]->mvhd->timescale);
+		len = (int64_t)be32toh(ctx->mp4_src[i]->mvhd->duration) * 1000 / be32toh(ctx->mp4_src[i]->mvhd->timescale);
 		if (len > longest_track)
 			longest_track = len;
 	}
