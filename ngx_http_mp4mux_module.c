@@ -744,7 +744,7 @@ static ngx_int_t mp4mux_do_read(mp4_file_t *f, mp4_buf_t *buf)
 	buf->aio_done = 0;
 	if (rc < 0)
 		return rc;
-	if (rc != newsz)
+	if (rc != newsz - f->rd_offs)
 		return NGX_ERROR;
 	buf->aio_done = 1;
 	f->rd_offs = 0;
@@ -967,12 +967,13 @@ static ngx_int_t mp4mux_seek(mp4_file_t *f, size_t offs) {
 	mp4_buf_t *buf;
 	size_t newoffs = offs / SECTOR_SIZE * SECTOR_SIZE;
 
+	f->offs = offs;
+	f->offs_restart = offs;
+
 	ngx_log_debug2(NGX_LOG_DEBUG_HTTP, f->log, 0,
 			"mp4mux_seek(%p, %i)", f, offs);
 
-	f->offs = offs;
 	f->offs_buf = offs - newoffs;
-	f->offs_restart = offs;
 	if (f->offs == f->file_size) {
 		f->rdbuf_cur = NULL;
 		return NGX_OK;
