@@ -683,7 +683,10 @@ static void ngx_http_mp4mux_read_handler(ngx_event_t *ev) {
 
 	if (req->blocked) return;
 	ctx = ngx_http_get_module_ctx(req, ngx_http_mp4mux_module);
-	if (ctx->done) return;
+	if (ctx->done || ctx->aio_handler == NULL) {
+		ngx_http_finalize_request(req, NGX_DONE); // Finalize properly after blocking
+		return;
+	}
 
 	if (f->offs != f->offs_restart) {
 		ngx_log_debug0(NGX_LOG_DEBUG_HTTP, f->log, 0,
@@ -1210,6 +1213,9 @@ static ngx_int_t mp4mux_send_response(ngx_http_mp4mux_ctx_t *ctx)
 		ctx->mp4_src[ctx->cur_trak]->rdbuf_size = i;
 	}
 	ctx->cur_trak = 0;
+	#if (NGX_HAVE_FILE_AIO)
+	ctx->aio_handler = NULL;
+	#endif
 
 	// Calculate ETag
 	etag = ngx_list_push(&r->headers_out.headers);
@@ -2594,17 +2600,19 @@ static void ngx_http_mp4mux_write_handler(ngx_event_t *ev)
 		"mp4mux write handler: \"%V?%V\"", &r->uri, &r->args);
 
 	ctx->write_handler(ev);
-	r->blocked--;
-	ngx_log_debug1(NGX_LOG_DEBUG_HTTP, c->log, 0, "blocked = %i", r->blocked);
 
-	if ((r->blocked && ctx->fmt == FMT_HLS_SEGMENT)
+	if ((r->blocked > 1 && ctx->fmt == FMT_HLS_SEGMENT)
 			|| c->destroyed || r->done || ctx->done) {
 		ev->handler = ctx->write_handler;
+		r->blocked--;
+		ngx_log_debug1(NGX_LOG_DEBUG_HTTP, c->log, 0, "blocked = %i", r->blocked);
 		return;
 	}
 
 	if (!r->out || !r->out->next) {
 		ev->handler = ctx->write_handler;
+		r->blocked--;
+		ngx_log_debug1(NGX_LOG_DEBUG_HTTP, c->log, 0, "blocked = %i", r->blocked);
 		switch (ctx->fmt) {
 		case FMT_MP4:
 			ngx_log_debug0(NGX_LOG_DEBUG_HTTP, c->log, 0, "calling mp4mux_write()");
