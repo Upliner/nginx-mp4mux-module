@@ -684,7 +684,7 @@ static void ngx_http_mp4mux_read_handler(ngx_event_t *ev) {
 	if (req->blocked) return;
 	ctx = ngx_http_get_module_ctx(req, ngx_http_mp4mux_module);
 	if (ctx->done || ctx->aio_handler == NULL) {
-		ngx_http_finalize_request(req, NGX_DONE); // Finalize properly after blocking
+		ngx_http_finalize_request(req, NGX_OK); // Finalize properly after blocking
 		return;
 	}
 
