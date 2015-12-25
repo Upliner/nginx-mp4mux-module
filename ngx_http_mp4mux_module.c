@@ -629,6 +629,14 @@ ngx_http_mp4mux_handler(ngx_http_request_t *r)
 	#endif
 	return mp4mux_send_response(ctx);
 }
+static ngx_int_t check_conn_error(ngx_http_request_t *r) {
+	if (r->connection->error && !r->blocked) {
+		ngx_http_free_request(r, NGX_ERROR);
+		ngx_http_close_connection(r->connection);
+		return 1;
+	}
+	return 0;
+}
 #if (NGX_HAVE_FILE_AIO)
 static void ngx_http_mp4mux_read_handler(ngx_event_t *ev) {
 	ngx_event_aio_t *aio;
@@ -684,8 +692,8 @@ static void ngx_http_mp4mux_read_handler(ngx_event_t *ev) {
 	if (req->blocked) return;
 	ctx = ngx_http_get_module_ctx(req, ngx_http_mp4mux_module);
 	if (ctx->done || req->connection->error || ctx->aio_handler == NULL) {
-		ngx_http_finalize_request(req,
-			req->connection->error ? NGX_DONE : NGX_OK); // Finalize properly after blocking
+		if (check_conn_error(req) == 0)
+			ngx_http_finalize_request(req, NGX_OK); // Finalize properly after blocking
 		return;
 	}
 
@@ -2609,8 +2617,7 @@ static void ngx_http_mp4mux_write_handler(ngx_event_t *ev)
 		ev->handler = ctx->write_handler;
 		r->blocked--;
 		ngx_log_debug1(NGX_LOG_DEBUG_HTTP, c->log, 0, "blocked = %i", r->blocked);
-		if (c->error)
-			ngx_http_finalize_request(r, NGX_DONE);
+		check_conn_error(r);
 		return;
 	}
 
