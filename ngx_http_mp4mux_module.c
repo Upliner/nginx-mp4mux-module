@@ -683,8 +683,9 @@ static void ngx_http_mp4mux_read_handler(ngx_event_t *ev) {
 
 	if (req->blocked) return;
 	ctx = ngx_http_get_module_ctx(req, ngx_http_mp4mux_module);
-	if (ctx->done || ctx->aio_handler == NULL) {
-		ngx_http_finalize_request(req, NGX_OK); // Finalize properly after blocking
+	if (ctx->done || req->connection->error || ctx->aio_handler == NULL) {
+		ngx_http_finalize_request(req,
+			req->connection->error ? NGX_DONE : NGX_OK); // Finalize properly after blocking
 		return;
 	}
 
@@ -998,9 +999,9 @@ static ngx_int_t mp4mux_seek(mp4_file_t *f, size_t offs) {
 		// middle
 		if (f->rdbuf_cur != NULL && offs >= f->rdbuf_cur->offs)
 			buf = f->rdbuf_cur;
-		ngx_log_debug1(NGX_LOG_DEBUG_HTTP, f->log, 0,
-				"middle, offs_end = %i", buf->offs_end);
 		while (offs >= buf->offs_end) {
+			ngx_log_debug1(NGX_LOG_DEBUG_HTTP, f->log, 0,
+					"middle, offs_end = %i", buf->offs_end);
 			buf = mp4mux_list_entry(buf->entry.next, mp4_buf_t, entry);
 			if (&buf->entry == &f->rdbufs) {
 				ngx_log_error(NGX_LOG_ERR, f->log, 0,
@@ -1120,22 +1121,23 @@ static ngx_int_t mp4mux_readahead(mp4_file_t *f, ngx_int_t size) {
 #endif
 static ngx_int_t mp4mux_read_direct(mp4_file_t *f, u_char **data, size_t size) {
 	u_char *p;
-	mp4_buf_t *b, *buf;
+	mp4_buf_t *b, *nb;
 	ngx_int_t rc;
+	bool_t brk = 0;
 
 	ngx_log_debug3(NGX_LOG_DEBUG_HTTP, f->log, 0,
-			"mp4mux_read_direct(): %p %p %i", f, data, size);
+			"mp4mux_read_direct(): %p %i, %i", f, f->offs, size);
 
-	buf = mp4mux_alloc_rdbuf(f, (f->offs_buf + size + SECTOR_SIZE - 1)/SECTOR_SIZE*SECTOR_SIZE);
-	if (buf == NULL)
+	nb = mp4mux_alloc_rdbuf(f, (f->offs_buf + size + SECTOR_SIZE - 1)/SECTOR_SIZE*SECTOR_SIZE);
+	if (nb == NULL)
 		return NGX_ERROR;
-	buf->persist = 1;
-	buf->offs = f->rdbuf_cur->offs;
-	buf->offs_end = f->rdbuf_cur->offs + buf->size;
-	*data = buf->data + f->offs_buf;
+	nb->persist = 1;
+	nb->offs = f->rdbuf_cur->offs;
+	nb->offs_end = f->rdbuf_cur->offs + nb->size;
+	*data = nb->data + f->offs_buf;
 	f->rd_offs = 0;
-	p = buf->data;
-	for (b = f->rdbuf_cur; &b->entry != &f->rdbufs; f->rdbuf_cur = b) {
+	p = nb->data;
+	for (b = f->rdbuf_cur; &b->entry != &f->rdbufs && !brk; f->rdbuf_cur = b) {
 		ngx_memcpy(p, b->data, b->size);
 		ngx_log_debug3(NGX_LOG_DEBUG_HTTP, f->log, 0,
 				"memcpy %p %p %i", p, b->data, b->size);
@@ -1143,12 +1145,13 @@ static ngx_int_t mp4mux_read_direct(mp4_file_t *f, u_char **data, size_t size) {
 		f->rd_offs += b->size;
 		ngx_log_debug1(NGX_LOG_DEBUG_HTTP, f->log, 0,
 				"rd_offs = %i", f->rd_offs);
-		b = mp4mux_list_entry(f->rdbuf_cur->entry.next, mp4_buf_t, entry);
+		b = mp4mux_list_entry(b->entry.next, mp4_buf_t, entry);
+		if (f->rdbuf_cur->offs_end != b->offs) brk = 1;
 		mp4mux_free_rdbuf(f, f->rdbuf_cur);
-		if (f->rdbuf_cur->offs_end != b->offs) break;
 	}
-	mp4mux_list_add_tail(&buf->entry, &b->entry);
-	rc = mp4mux_do_read(f, buf);
+	mp4mux_list_add_tail(&nb->entry, &b->entry);
+	f->rdbuf_cur = nb;
+	rc = mp4mux_do_read(f, nb);
 	if (mp4mux_seek(f, f->offs + size) != NGX_OK)
 		return NGX_ERROR;
 	if (rc != NGX_OK)
@@ -2602,10 +2605,12 @@ static void ngx_http_mp4mux_write_handler(ngx_event_t *ev)
 	ctx->write_handler(ev);
 
 	if ((r->blocked > 1 && ctx->fmt == FMT_HLS_SEGMENT)
-			|| c->destroyed || r->done || ctx->done) {
+			|| c->destroyed || c->error || r->done || ctx->done) {
 		ev->handler = ctx->write_handler;
 		r->blocked--;
 		ngx_log_debug1(NGX_LOG_DEBUG_HTTP, c->log, 0, "blocked = %i", r->blocked);
+		if (c->error)
+			ngx_http_finalize_request(r, NGX_DONE);
 		return;
 	}
 
