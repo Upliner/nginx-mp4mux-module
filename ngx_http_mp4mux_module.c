@@ -1014,7 +1014,7 @@ static ngx_int_t mp4mux_seek(mp4_file_t *f, size_t offs) {
 				"before first", buf->offs);
 		entry = &buf->entry;
 		if (buf->offs - newoffs < f->rdbuf_size)
-			buf = mp4mux_get_rdbuf_sz(f, newoffs, buf->offs - newoffs);
+			buf = mp4mux_get_rdbuf_sz(f, buf->offs - newoffs, newoffs);
 		else
 			buf = mp4mux_get_rdbuf(f, newoffs);
 		mp4mux_list_add_tail(&buf->entry, entry);
