@@ -2593,12 +2593,19 @@ static ngx_int_t mp4mux_write(ngx_http_mp4mux_ctx_t *ctx)
 	return NGX_OK;
 }
 
+#if (NGX_HAVE_FILE_AIO)
+extern ngx_module_t ngx_http_copy_filter_module;
+#endif
+
 static void ngx_http_mp4mux_write_handler(ngx_event_t *ev)
 {
 	ngx_connection_t *c;
 	ngx_http_request_t *r;
 	ngx_http_mp4mux_ctx_t *ctx;
 	ngx_int_t rc;
+	#if (NGX_HAVE_FILE_AIO)
+	ngx_output_chain_ctx_t *outctx;
+	#endif
 
 	c = ev->data;
 	r = c->data;
@@ -2611,6 +2618,14 @@ static void ngx_http_mp4mux_write_handler(ngx_event_t *ev)
 		"mp4mux write handler: \"%V?%V\"", &r->uri, &r->args);
 
 	ctx->write_handler(ev);
+
+	#if (NGX_HAVE_FILE_AIO)
+	if (r->aio) {
+		outctx = ngx_http_get_module_ctx(r, ngx_http_copy_filter_module);
+		if (outctx != NULL && outctx->in && outctx->in->next)
+			return;
+	}
+	#endif
 
 	if ((r->blocked > 1 && ctx->fmt == FMT_HLS_SEGMENT)
 			|| c->destroyed || c->error || r->done || ctx->done) {
