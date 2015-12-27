@@ -361,6 +361,21 @@ typedef struct {
 	ngx_int_t segment_ms;
 } ngx_http_mp4mux_conf_t;
 
+/* These two structs must be kept in sync with ngx_http_range_filter_module.c
+   It seems that there are no other way to hook range-skipping.
+   Fortunately, these structures changes really rarely,
+   last changed 29 Dec 2006 */
+typedef struct {
+	off_t        start;
+	off_t        end;
+	ngx_str_t    content_range;
+} ngx_http_range_t;
+typedef struct {
+	off_t        offset;
+	ngx_str_t    boundary_header;
+	ngx_array_t  ranges;
+} ngx_http_range_filter_ctx_t;
+
 static uint32_t mp4_atom_containers[] = {
 	ATOM('m', 'o', 'o', 'v'),
 	ATOM('t', 'r', 'a', 'k'),
@@ -380,6 +395,8 @@ static const u_char m3u8_header[] =
 static const char m3u8_entry[] = "#EXTINF:%i.%03i,\nhttp://%V%V&fmt=hls/seg-%i.ts\n";
 
 static const u_char m3u8_footer[] = "#EXT-X-ENDLIST\n";
+
+extern ngx_module_t ngx_http_range_body_filter_module;
 
 static char *ngx_http_mp4mux(ngx_conf_t *cf, ngx_command_t *cmd, void *conf);
 static void *ngx_http_mp4mux_create_conf(ngx_conf_t *cf);
@@ -503,6 +520,7 @@ ngx_http_mp4mux_handler(ngx_http_request_t *r)
 	ngx_str_t fname;
 	ngx_http_mp4mux_conf_t   *conf;
 	ngx_log_t *log = r->connection->log;
+	ngx_http_range_filter_ctx_t *rangectx;
 
 	ngx_log_debug0(NGX_LOG_DEBUG_HTTP, log, 0,
 		"http_mp4mux_handler");
@@ -517,6 +535,13 @@ ngx_http_mp4mux_handler(ngx_http_request_t *r)
 
 	if (rc != NGX_OK)
 		return rc;
+
+	rangectx = ngx_http_get_module_ctx(r, ngx_http_range_body_filter_module);
+	if (rangectx != NULL && rangectx->ranges.nelts != 1) {
+		ngx_log_error(NGX_LOG_ERR, log, 0,
+			"mp4mux: requests with multiple ranges are not supported", &value);
+		return NGX_HTTP_BAD_REQUEST;
+	}
 
 	conf = ngx_http_get_module_loc_conf(r, ngx_http_mp4mux_module);
 
@@ -1221,8 +1246,8 @@ static ngx_int_t mp4mux_read_direct(mp4_file_t *f, u_char **data, size_t size) {
 	return rc >= 0 ? NGX_OK : rc;
 }
 static ngx_int_t mp4mux_handle_write_rc(ngx_http_request_t *r, ngx_int_t rc) {
-    ngx_http_core_loc_conf_t  *clcf;
-    ngx_event_t *ev;
+	ngx_http_core_loc_conf_t  *clcf;
+	ngx_event_t *ev;
 	if (rc == NGX_AGAIN) {
 		ngx_log_debug0(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
 			"mp4mux: ngx_http_output_filter() returned NGX_AGAIN, setting handler");
@@ -2558,7 +2583,6 @@ static ngx_int_t mp4mux_hls_write(ngx_http_mp4mux_ctx_t *ctx)
 		"mp4mux: DONE! rc = %i", rc);
 	return rc;
 }
-
 static ngx_int_t mp4mux_write(ngx_http_mp4mux_ctx_t *ctx)
 {
 	ngx_buf_t *b;
@@ -2567,8 +2591,18 @@ static ngx_int_t mp4mux_write(ngx_http_mp4mux_ctx_t *ctx)
 	ngx_chain_t *out, *c;
 	ngx_int_t  j = ctx->cur_trak;
 	ngx_int_t rc = NGX_OK;
-	ngx_uint_t size;
+	ngx_int_t size;
 	ngx_http_request_t *r = ctx->req;
+	ngx_http_range_filter_ctx_t *rangectx;
+	ngx_http_range_t *range = NULL;
+	ngx_int_t skipping = 0;
+
+	rangectx = ngx_http_get_module_ctx(r, ngx_http_range_body_filter_module);
+	if (rangectx != NULL)
+		range = rangectx->ranges.elts;
+
+	if (range && rangectx->offset < range->start)
+		skipping = 1;
 
 	while (j < ctx->trak_cnt) {
 		size = ctx->mp4_src[j]->chunk_size[ctx->chunk_num];
@@ -2576,7 +2610,30 @@ static ngx_int_t mp4mux_write(ngx_http_mp4mux_ctx_t *ctx)
 		ngx_log_debug3(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
 			"mp4mux: trak=%i chunk=%i size=%i", j, ctx->chunk_num, size);
 
-		if (size) {
+		if (range) {
+			if (rangectx->offset >= range->end) {
+				ngx_log_debug0(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
+					"mp4mux: rangeskipped done");
+				ctx->done = 1;
+				return NGX_OK;
+			}
+		}
+		if (skipping) {
+			if (rangectx->offset + size <= range->start) {
+				ngx_log_debug2(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
+					"mp4mux: range skip: offs %i start %i", rangectx->offset, range->start);
+				ctx->mp4_src[j]->mdat_pos += size;
+				rangectx->offset += size;
+			} else {
+				for (j = 0; j < ctx->trak_cnt; j++)
+					if (ctx->mp4_src[j]->file.directio)
+						mp4mux_seek(ctx->mp4_src[j], ctx->mp4_src[j]->mdat_pos);
+				j = ctx->cur_trak;
+				skipping = 0;
+			}
+		}
+
+		if (size && !skipping) {
 			if (ctx->mp4_src[j]->file.directio) {
 				#if (NGX_HAVE_FILE_AIO)
 				if (ctx->mp4_src[j]->aio) {
@@ -2595,7 +2652,7 @@ static ngx_int_t mp4mux_write(ngx_http_mp4mux_ctx_t *ctx)
 							ctx->free = out->next;
 						else {
 							for (c = ctx->free; c->next != out; c = c->next) { }
-								c->next = out->next;
+							c->next = out->next;
 						}
 						out->next = NULL;
 						break;
