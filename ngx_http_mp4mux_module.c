@@ -3604,6 +3604,8 @@ ngx_http_mp4mux_create_conf(ngx_conf_t *cf)
 	conf->segment_ms = NGX_CONF_UNSET_MSEC;
 	conf->hls_prefix.data = NULL;
 	conf->hls_prefix.len = 0;
+	conf->hp_lengths = NULL;
+	conf->hp_values = NULL;
 
 	return conf;
 }
