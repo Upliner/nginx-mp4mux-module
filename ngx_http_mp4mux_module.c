@@ -323,6 +323,7 @@ typedef struct {
 	ngx_int_t rd_offs;
 	#if (NGX_HAVE_FILE_AIO)
 	bool_t aio;
+	off_t sent_pos;
 	// Data for async reading of large atoms (like moov)
 	mp4_atom_t *aio_atom;
 	mp4_buf_t *aio_buf;
@@ -1506,6 +1507,11 @@ static ngx_int_t mp4mux_send_response(ngx_http_mp4mux_ctx_t *ctx)
 	ngx_chain_update_chains(&ctx->free, &ctx->busy, &out, &ngx_http_mp4mux_module);
 	#endif
 
+	ctx->chain_last = ctx->busy;
+	if (ctx->chain_last)
+		while (ctx->chain_last->next)
+			ctx->chain_last = ctx->chain_last->next;
+
 	ngx_log_debug1(NGX_LOG_DEBUG_HTTP, log, 0,
 		"http_mp4mux rc=%i", rc);
 
@@ -2614,12 +2620,38 @@ static ngx_int_t mp4mux_hls_write(ngx_http_mp4mux_ctx_t *ctx)
 		"mp4mux: DONE! rc = %i", rc);
 	return rc;
 }
+
+void mp4mux_update_chains(ngx_http_mp4mux_ctx_t *ctx, ngx_chain_t *out)
+{
+    ngx_chain_t  *cl;
+
+    if (ctx->busy == NULL) {
+		ctx->busy = out;
+        ctx->chain_last = out;
+    } else {
+    	ctx->chain_last->next = out;
+        ctx->chain_last = out;
+    }
+    while (ctx->chain_last->next)
+		ctx->chain_last = ctx->chain_last->next;
+
+    while (ctx->busy) {
+		cl = ctx->busy;
+		if (ngx_buf_size(cl->buf) != 0)
+			break;
+		if (cl->buf->file_last > ctx->mp4_src[cl->buf->num]->sent_pos)
+			ctx->mp4_src[cl->buf->num]->sent_pos = cl->buf->file_last;
+        ctx->busy = cl->next;
+        cl->next = ctx->free;
+        ctx->free = cl;
+    }
+}
 static ngx_int_t mp4mux_write(ngx_http_mp4mux_ctx_t *ctx)
 {
 	ngx_buf_t *b;
 	mp4_buf_t *rdbuf;
 	mp4mux_list_t *pos, *pos2;
-	ngx_chain_t *out, *c;
+	ngx_chain_t *out;
 	ngx_int_t  j = ctx->cur_trak;
 	ngx_int_t rc = NGX_OK;
 	ngx_int_t size;
@@ -2665,60 +2697,32 @@ static ngx_int_t mp4mux_write(ngx_http_mp4mux_ctx_t *ctx)
 		}
 
 		if (size && !skipping) {
+			#if (NGX_HAVE_FILE_AIO)
 			if (ctx->mp4_src[j]->file.directio) {
-				#if (NGX_HAVE_FILE_AIO)
 				if (ctx->mp4_src[j]->aio) {
 					rc = mp4mux_readahead(ctx->mp4_src[j], size);
 					if (rc != NGX_OK) return rc;
 				}
-				#endif
-				// Try to find first free buffer for corresponding track
-				for (out = ctx->free; out; out = out->next) {
-					b = out->buf;
-					if (b->num == j) {
-						ngx_log_debug2(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
-							"found corresponding buf for %i, offs = %i", j, b->file_last);
-						// Unlink found chain link from "free" chain
-						if (ctx->free == out)
-							ctx->free = out->next;
-						else {
-							for (c = ctx->free; c->next != out; c = c->next) { }
-							c->next = out->next;
-						}
-						out->next = NULL;
-						break;
-					}
-				}
 			}
-			else
-				out = NULL;
-			if (!out) {
-				out = ngx_chain_get_free_buf(r->pool, &ctx->free);
-				if (!out)
-					return NGX_ERROR;
+			#endif
+			out = ngx_chain_get_free_buf(r->pool, &ctx->free);
+			if (!out)
+				return NGX_ERROR;
 
-				b = out->buf;
-				b->num = -1;
-			}
+			b = out->buf;
 
 			b->flush = 1;
 			b->tag = &ngx_http_mp4mux_module;
+			b->num = j;
 
-			// nginx doesn't use sendfile in directio mode, it uses temporary buffers anyway
-			// use our own buffers for more effective reading and to avoid memory leaks
 			if (ctx->mp4_src[j]->file.directio) {
-				if (b->num == j)
-					// Free all successfully written buffers
-					mp4mux_list_for_each_safe(pos, pos2, &ctx->mp4_src[j]->rdbufs) {
-						rdbuf = mp4mux_list_entry(pos, mp4_buf_t, entry);
-						ngx_log_debug4(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
-							"checking buf %p %i-%i wrpos=%i", rdbuf, rdbuf->offs, rdbuf->offs_end, b->file_last);
-						if ((off_t)rdbuf->offs_end > b->file_last) break;
-						mp4mux_free_rdbuf(ctx->mp4_src[j], rdbuf);
-					}
+				// nginx doesn't use sendfile in directio mode, it uses temporary buffers anyway
+				// use our own buffers for more effective reading and to avoid memory leaks
 				if (mp4mux_read_chain(ctx->mp4_src[j], out, &ctx->free, size) != NGX_OK)
 					return NGX_ERROR;
-
+				mp4mux_nextrdbuf(ctx->mp4_src[j]); // prefetch next buf
+				b->in_file = 0;
+				b->memory = 1;
 			} else {
 				b->file = &ctx->mp4_src[j]->file;
 				b->file_pos = ctx->mp4_src[j]->mdat_pos;
@@ -2727,17 +2731,23 @@ static ngx_int_t mp4mux_write(ngx_http_mp4mux_ctx_t *ctx)
 				b->memory = 0;
 			}
 
-			b->num = j;
 			ctx->mp4_src[j]->mdat_pos += size;
 			b->file_last = ctx->mp4_src[j]->mdat_pos;
 
 			rc = ngx_http_output_filter(r, out);
 
-			#if nginx_version > 1001000
-			ngx_chain_update_chains(r->pool, &ctx->free, &ctx->busy, &out, &ngx_http_mp4mux_module);
-			#else
-			ngx_chain_update_chains(&ctx->free, &ctx->busy, &out, &ngx_http_mp4mux_module);
-			#endif
+			mp4mux_update_chains(ctx, out);
+
+			if (out->next && ctx->mp4_src[j]->file.directio) {
+				// Free all successfully written buffers
+				mp4mux_list_for_each_safe(pos, pos2, &ctx->mp4_src[j]->rdbufs) {
+					rdbuf = mp4mux_list_entry(pos, mp4_buf_t, entry);
+					ngx_log_debug4(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
+						"checking buf %p %i-%i sent_pos=%i", rdbuf, rdbuf->offs, rdbuf->offs_end, ctx->mp4_src[j]->sent_pos);
+					if ((off_t)rdbuf->offs_end > ctx->mp4_src[j]->sent_pos) break;
+					mp4mux_free_rdbuf(ctx->mp4_src[j], rdbuf);
+				}
+			}
 		}
 
 		while (++j < ctx->trak_cnt && ctx->chunk_num >= ctx->mp4_src[j]->chunk_cnt)
@@ -3593,19 +3603,14 @@ ngx_http_mp4mux_create_conf(ngx_conf_t *cf)
 {
 	ngx_http_mp4mux_conf_t  *conf;
 
-	conf = ngx_palloc(cf->pool, sizeof(ngx_http_mp4mux_conf_t));
-	if (conf == NULL) {
+	conf = ngx_pcalloc(cf->pool, sizeof(ngx_http_mp4mux_conf_t));
+	if (conf == NULL)
 		return NULL;
-	}
 
 	conf->rdbuf_size = NGX_CONF_UNSET_SIZE;
 	conf->wrbuf_size = NGX_CONF_UNSET_SIZE;
 	conf->move_meta = NGX_CONF_UNSET;
 	conf->segment_ms = NGX_CONF_UNSET_MSEC;
-	conf->hls_prefix.data = NULL;
-	conf->hls_prefix.len = 0;
-	conf->hp_lengths = NULL;
-	conf->hp_values = NULL;
 
 	return conf;
 }
@@ -3634,8 +3639,7 @@ ngx_http_mp4mux_merge_conf(ngx_conf_t *cf, void *parent, void *child)
 	sc.complete_lengths = 1;
 	sc.complete_values = 1;
 
-	if (ngx_http_script_compile(&sc) != NGX_OK) {
+	if (ngx_http_script_compile(&sc) != NGX_OK)
 		return NGX_CONF_ERROR;
-	}
 	return NGX_CONF_OK;
 }
