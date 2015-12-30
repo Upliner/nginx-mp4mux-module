@@ -1,11 +1,10 @@
 m3u8: move static parts to separate nginx buffers
-m3u8: use relative paths
-use log10-like functions instead of INT_MAX when allocating memory
 move Content-Disposition generation code to single place?
 use SHA1 in ETag
 get rid of init_atom_wptr functions
 use constants instead of magic numbers
 mp4mux_preread() is hack, get rid of it
-use separate rdbufs for unaligned file tails, read them synchronously in mp4mux_read_direct()?
 offs_restart is hack, get rid of it
 Use b->last instead of p in mp4mux_hls_write()?
+Metadata cache!
+split mp4mux_send_response function

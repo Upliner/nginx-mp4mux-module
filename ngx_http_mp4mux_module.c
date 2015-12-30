@@ -30,12 +30,6 @@
 #define __packed __attribute__((packed))
 #endif
 
-#if (NGX_LINUX)
-#define MP4MUX_CHECK_EVENTS 1
-#else
-#define MP4MUX_CHECK_EVENTS 0
-#endif
-
 #define FMT_MP4 0x00
 #define FMT_HLS_INDEX 0x10
 #define FMT_HLS_SEGMENT 0x11
@@ -50,6 +44,8 @@
 
 #define PES_VIDEO 0xe0
 #define PES_AUDIO 0xc0
+
+#define MP4MUX_HDR_NUM (-2)
 
 #define SECTOR_SIZE 4096  // you can set it to 512 if you don't use 4Kn drives
 
@@ -334,6 +330,7 @@ typedef struct {
 	mp4_atom_t *aio_atom;
 	mp4_buf_t *aio_buf;
 	#endif
+	bool_t check;
 
 	mp4_hls_ctx_t *hls_ctx;
 } mp4_file_t;
@@ -358,6 +355,7 @@ typedef struct ngx_http_mp4mux_ctx_s {
 	ngx_int_t start;
 	ngx_int_t move_meta;
 	ngx_int_t segment_ms;
+	ngx_pool_t *hdr_pool;
 	bool_t done;
 } ngx_http_mp4mux_ctx_t;
 
@@ -421,7 +419,7 @@ static ngx_int_t mp4mux_read_direct(mp4_file_t *f, u_char **data, size_t size); 
 static void mp4mux_free_rdbuf(mp4_file_t *f, mp4_buf_t *buf);
 
 static ngx_int_t mp4_parse(mp4_file_t *f);
-static ngx_int_t mp4_clone(mp4_file_t *src, mp4_file_t *dst);
+static ngx_int_t mp4_clone(mp4_file_t *src, mp4_file_t *dst, ngx_pool_t *pool);
 static mp4_atom_t *mp4_clone_atom(mp4_atom_t *src, mp4_atom_t *parent, mp4_file_t *dst);
 static mp4_atom_t *mp4_find_atom(struct mp4mux_list_head *list, uint32_t type);
 static off_t mp4_build_atoms(mp4_file_t *mp4f);
@@ -438,6 +436,7 @@ static void ngx_http_mp4mux_write_handler(ngx_event_t *ev);
 static ngx_int_t mp4mux_send_response(ngx_http_mp4mux_ctx_t *ctx);
 static ngx_int_t mp4mux_hls_send_index(ngx_http_mp4mux_ctx_t *ctx);
 static ngx_int_t mp4mux_hls_send_segment(ngx_http_mp4mux_ctx_t *ctx);
+static void mp4mux_cleanup(void *data);
 
 static ngx_command_t  ngx_http_mp4mux_commands[] = {
 
@@ -700,16 +699,14 @@ static ngx_int_t mp4mux_finish_read(mp4_file_t *f) {
 	mp4_buf_t *buf = f->aio_buf;
 	ngx_int_t rc;
 	rc = ngx_file_aio_read(&f->file, NULL, 0, 0, f->pool);
-	if (rc == NGX_AGAIN) return rc;
 	f->req->blocked--;
 	ngx_log_debug1(NGX_LOG_DEBUG_HTTP, f->log, 0, "blocked = %i", f->req->blocked);
-	if (buf == NULL) {
-		ngx_log_error(NGX_LOG_ERR, f->log, 0, "mp4mux_finish_read: aio buffer is null!");
+	if (rc < 0) {
+		ngx_log_error(NGX_LOG_ERR, f->log, 0, "async read failed, rc = %i", rc);
 		return NGX_ERROR;
 	}
-	if (rc < 0)
-	{
-		ngx_log_error(NGX_LOG_ERR, f->log, 0, "async read failed, rc = %i", rc);
+	if (buf == NULL) {
+		ngx_log_error(NGX_LOG_ERR, f->log, 0, "mp4mux_finish_read: aio buffer is null!");
 		return NGX_ERROR;
 	}
 	if (rc != (ngx_int_t)(buf->offs_end - buf->offs - f->rd_offs)) {
@@ -748,10 +745,11 @@ static void ngx_http_mp4mux_read_handler(ngx_event_t *ev) {
 	req = f->req;
 
 	rc = mp4mux_finish_read(f);
-	if (rc == NGX_ERROR)
-		ngx_http_finalize_request(req, rc);
-	if (rc != NGX_OK)
+	if (rc != NGX_OK) {
+		if (rc != NGX_AGAIN)
+			ngx_http_finalize_request(req, rc);
 		return;
+	}
 
 	if (req->blocked) return;
 	ctx = ngx_http_get_module_ctx(req, ngx_http_mp4mux_module);
@@ -773,59 +771,6 @@ static void ngx_http_mp4mux_read_handler(ngx_event_t *ev) {
 	if (rc != NGX_AGAIN)
 		ngx_http_finalize_request(req, rc);
 }
-#if (MP4MUX_CHECK_EVENTS) // Really hacky low-level tweaks
-extern aio_context_t ngx_aio_ctx;
-static int io_getevents(aio_context_t ctx, long min_nr, long nr, struct io_event *events, struct timespec *tmo)
-{
-	return syscall(SYS_io_getevents, ctx, min_nr, nr, events, tmo);
-}
-static ngx_int_t mp4mux_check_events(mp4_file_t *checkf)
-{
-	ngx_int_t numevents;
-	ngx_int_t i, rc, result = NGX_AGAIN;
-	ngx_event_t *e;
-	ngx_event_aio_t *aio;
-	mp4_file_t *f;
-	struct io_event events[64];
-	struct timespec ts = {0, 0};
-
-	numevents = io_getevents(ngx_aio_ctx, 0, 64, events, &ts);
-
-	if (numevents < 0) {
-		ngx_log_error(NGX_LOG_ALERT, checkf->log, ngx_errno,
-			"mp4mux: io_getevents() failed");
-		return NGX_ERROR;
-	}
-
-	ngx_log_debug1(NGX_LOG_DEBUG_EVENT, checkf->log, 0,
-		"mp4mux: io_getevents: %l", numevents);
-
-	for (i = 0; i < numevents; i++) {
-		ngx_log_debug4(NGX_LOG_DEBUG_EVENT, checkf->log, 0,
-			"mp4mux: io_event: %uXL %uXL %L %L",
-			events[i].data, events[i].obj, events[i].res, events[i].res2);
-
-		e = (ngx_event_t *) (uintptr_t) events[i].data;
-
-		e->complete = 1;
-		e->active = 0;
-		e->ready = 1;
-
-		aio = e->data;
-		aio->res = events[i].res;
-		if (aio->handler == ngx_http_mp4mux_read_handler) {
-			f = (mp4_file_t*)aio->data;
-			rc = mp4mux_finish_read(f);
-			if (rc == NGX_ERROR)
-				result = NGX_ERROR;
-			if (f == checkf && rc != NGX_ERROR)
-				result = rc;
-		} else
-			ngx_post_event(e, &ngx_posted_events);
-	}
-	return result;
-}
-#endif
 #endif
 static ngx_int_t mp4mux_checkeof(mp4_file_t *f, mp4_buf_t *buf)
 {
@@ -1275,11 +1220,6 @@ static ngx_int_t mp4mux_readahead(mp4_file_t *f, ngx_int_t size) {
 	size -= buf->size-f->offs_buf;
 	while (1) {
 		ngx_log_debug1(NGX_LOG_DEBUG_HTTP, f->log, 0, "buf %p", buf);
-		#if (MP4MUX_CHECK_EVENTS)
-		if (!buf->aio_done && f->aio_buf != NULL)
-			if (mp4mux_check_events(f) == NGX_ERROR)
-				return NGX_ERROR;
-		#endif
 		if (!buf->aio_done) {
 			ngx_log_debug1(NGX_LOG_DEBUG_HTTP, f->log, 0,
 				"buf %p is still incomplete", buf);
@@ -1380,6 +1320,7 @@ static ngx_int_t mp4mux_send_response(ngx_http_mp4mux_ctx_t *ctx)
 	ngx_uint_t chunk_num, sc;
 	ngx_uint_t total_samples = 0, min_samples = INT_MAX;
 	ngx_table_elt_t *etag;
+	ngx_http_cleanup_t *cln;
 	u_char *etag_val;
 	double corr;
 
@@ -1437,11 +1378,27 @@ static ngx_int_t mp4mux_send_response(ngx_http_mp4mux_ctx_t *ctx)
 		return mp4mux_hls_send_segment(ctx);
 	}
 
-	if (mp4_clone(ctx->mp4_src[0], &ctx->mp4f))
-		return NGX_HTTP_INTERNAL_SERVER_ERROR;
+	if (ctx->move_meta) {
+		// Place output header buffers into separate pool so we can free memory after they're sent
+		ctx->hdr_pool = ngx_create_pool(4096, r->connection->log);
+		if (!ctx->hdr_pool)
+			return NGX_HTTP_INTERNAL_SERVER_ERROR;
 
-	if (!ctx->move_meta)
+		cln = ngx_http_cleanup_add(r, 0);
+		if (!cln)
+			return NGX_HTTP_INTERNAL_SERVER_ERROR;
+
+		cln->handler = mp4mux_cleanup;
+		cln->data = ctx;
+
+		rc = mp4_clone(ctx->mp4_src[0], &ctx->mp4f, ctx->hdr_pool);
+	} else {
+		rc = mp4_clone(ctx->mp4_src[0], &ctx->mp4f, ctx->req->pool);
 		mp4_split(&ctx->mp4f);
+	}
+
+	if (rc != NGX_OK)
+		return NGX_HTTP_INTERNAL_SERVER_ERROR;
 
 	trak[0] = ctx->mp4f.trak;
 
@@ -1546,9 +1503,11 @@ static ngx_int_t mp4mux_send_response(ngx_http_mp4mux_ctx_t *ctx)
 	}
 
 	for (i = 0; i < n; i++)
-		if (ctx->mp4_src[i]->file.directio)
+		if (ctx->mp4_src[i]->file.directio) {
 			if (mp4mux_seek(ctx->mp4_src[i], ctx->mp4_src[i]->mdat_pos) != NGX_OK)
 				return NGX_HTTP_INTERNAL_SERVER_ERROR;
+		} else
+			ctx->mp4_src[i]->offs_buf = NGX_MAX_INT_T_VALUE;
 
 	r->root_tested = !r->error_page;
 
@@ -1598,6 +1557,15 @@ static ngx_int_t mp4mux_send_response(ngx_http_mp4mux_ctx_t *ctx)
 		return rc;
 	}
 	return mp4mux_write(ctx);
+}
+static void mp4mux_cleanup(void *data)
+{
+	ngx_http_mp4mux_ctx_t *ctx = data;
+
+	if (ctx->hdr_pool) {
+		ngx_destroy_pool(ctx->hdr_pool);
+		ctx->hdr_pool = NULL;
+	}
 }
 static ngx_int_t mp4mux_hls_get_baseuri(ngx_http_request_t *r, ngx_http_variable_value_t *v, uintptr_t data)
 {
@@ -2328,18 +2296,8 @@ static ngx_buf_t *hls_newbuf(ngx_http_mp4mux_ctx_t *ctx) {
 }
 static ngx_buf_t *hls_newpacket(ngx_buf_t *b, ngx_http_mp4mux_ctx_t *ctx, mp4_hls_ctx_t *hls_ctx, u_char typ1, u_char typ2) {
 	hls_ctx->packet_count--;
-	if (b->last > b->end) {
-		ngx_log_error(NGX_LOG_ERR, ctx->req->connection->log, 0,
-			"mp4mux_hls_newpacket(): buffer overflow detected: b->last = %p, b->end = %p", b->last, b->end);
-		return NULL;
-	}
 	if (b->last == b->end)
 		b = hls_newbuf(ctx);
-	else if ((b->last - b->start) % MPEGTS_PACKET_SIZE != 0) {
-		ngx_log_error(NGX_LOG_ERR, ctx->req->connection->log, 0,
-			"mp4mux_hls_newpacket(): buffer is misaligned: b->last = %p, b->start = %p", b->last, b->start);
-		return NULL;
-	}
 	b->last[0] = 0x47; // Sync byte
 	b->last[1] = typ1;
 	b->last[2] = ctx->cur_trak;
@@ -2667,14 +2625,6 @@ static ngx_int_t mp4mux_hls_write(ngx_http_mp4mux_ctx_t *ctx)
 			chain->next = NULL;
 		}
 
-		if (ctx->chain_last->next != NULL || ctx->chain->next == ctx->chain) {
-			ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
-				"Chain loop!!!");
-			return NGX_HTTP_INTERNAL_SERVER_ERROR;
-		}
-		ngx_log_debug4(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
-			"output: chain=%p chain->buf->start=%p chain_last=%p chain_last->buf->start=%p",
-			ctx->chain, ctx->chain->buf->start, ctx->chain_last, ctx->chain_last->buf->start);
 		rc = ngx_http_output_filter(r, ctx->chain);
 		#if nginx_version > 1001000
 		ngx_chain_update_chains(r->pool, &ctx->free, &ctx->busy, &ctx->chain,
@@ -2708,7 +2658,7 @@ void mp4mux_update_chains(ngx_http_mp4mux_ctx_t *ctx, ngx_chain_t *out)
 		cl = ctx->busy;
 		if (ngx_buf_size(cl->buf) != 0)
 			break;
-		if (cl->buf->file_last > ctx->mp4_src[cl->buf->num]->sent_pos)
+		if (cl->buf->num >= 0 && cl->buf->file_last > ctx->mp4_src[cl->buf->num]->sent_pos)
 			ctx->mp4_src[cl->buf->num]->sent_pos = cl->buf->file_last;
 		ctx->busy = cl->next;
 		cl->next = ctx->free;
@@ -2721,14 +2671,13 @@ static ngx_int_t mp4mux_write(ngx_http_mp4mux_ctx_t *ctx)
 	mp4_buf_t *rdbuf;
 	mp4mux_list_t *pos, *pos2;
 	ngx_chain_t *out;
-	ngx_int_t  j = ctx->cur_trak;
+	ngx_int_t j = ctx->cur_trak;
 	ngx_int_t rc = NGX_OK;
-	ngx_int_t size;
+	ngx_uint_t size;
 	ngx_http_request_t *r = ctx->req;
 	ngx_http_range_filter_ctx_t *rangectx;
 	ngx_http_range_t *range = NULL;
 	bool_t skipping = 0;
-	bool_t check = 0;
 
 	rangectx = ngx_http_get_module_ctx(r, ngx_http_range_body_filter_module);
 	if (rangectx != NULL)
@@ -2752,7 +2701,7 @@ static ngx_int_t mp4mux_write(ngx_http_mp4mux_ctx_t *ctx)
 			}
 		}
 		if (skipping) {
-			if (rangectx->offset + size <= range->start) {
+			if (rangectx->offset + size <= (size_t)range->start) {
 				ngx_log_debug2(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
 					"mp4mux: range skip: offs %i start %i", rangectx->offset, range->start);
 				ctx->mp4_src[j]->mdat_pos += size;
@@ -2790,11 +2739,8 @@ static ngx_int_t mp4mux_write(ngx_http_mp4mux_ctx_t *ctx)
 				// use our own buffers for more effective reading and to avoid memory leaks
 				if (mp4mux_read_chain(ctx->mp4_src[j], out, &ctx->free, size) != NGX_OK)
 					return NGX_ERROR;
-				mp4mux_nextrdbuf(ctx->mp4_src[j]); // prefetch next buf
 				b->in_file = 0;
 				b->memory = 1;
-				if (out->next)
-					check = 1;
 			} else {
 				b->file = &ctx->mp4_src[j]->file;
 				b->file_pos = ctx->mp4_src[j]->mdat_pos;
@@ -2810,16 +2756,27 @@ static ngx_int_t mp4mux_write(ngx_http_mp4mux_ctx_t *ctx)
 
 			mp4mux_update_chains(ctx, out);
 
-			if (check) {
-				// Free all successfully written buffers
+			if (ctx->mp4_src[j]->offs_buf <= size)
+				ctx->mp4_src[j]->check = 1;
+
+			if (ctx->mp4_src[j]->check) {
+				// Free all successfully sent buffers
 				mp4mux_list_for_each_safe(pos, pos2, &ctx->mp4_src[j]->rdbufs) {
 					rdbuf = mp4mux_list_entry(pos, mp4_buf_t, entry);
 					ngx_log_debug4(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
 						"checking buf %p %i-%i sent_pos=%i", rdbuf, rdbuf->offs, rdbuf->offs_end, ctx->mp4_src[j]->sent_pos);
 					if ((off_t)rdbuf->offs_end > ctx->mp4_src[j]->sent_pos) break;
+					if (rdbuf->offs_end == ctx->mp4_src[j]->rdbuf_cur->offs)
+						ctx->mp4_src[j]->check = 0;
 					mp4mux_free_rdbuf(ctx->mp4_src[j], rdbuf);
 				}
-				check = 0;
+				if (!ctx->mp4_src[j]->check)
+					mp4mux_nextrdbuf(ctx->mp4_src[j]); // prefetch next buf after freeing previous one
+			}
+			// Free headers if they were sent
+			if (ctx->hdr_pool && (ctx->busy == NULL || ctx->busy->buf->num != MP4MUX_HDR_NUM)) {
+				ngx_destroy_pool(ctx->hdr_pool);
+				ctx->hdr_pool = NULL;
 			}
 		}
 
@@ -2899,11 +2856,7 @@ static void ngx_http_mp4mux_write_handler(ngx_event_t *ev)
 	}
 	#endif
 
-	if (c->destroyed || c->error || r->done || ctx->done
-			#if (NGX_HAVE_FILE_AIO)
-			|| (r->blocked > 1 && ctx->aio_handler != NULL)
-			#endif
-			) {
+	if (c->destroyed || c->error || r->done || ctx->done) {
 		ev->handler = ctx->write_handler;
 		r->blocked--;
 		ngx_log_debug1(NGX_LOG_DEBUG_HTTP, c->log, 0, "blocked = %i", r->blocked);
@@ -3172,10 +3125,10 @@ static ngx_int_t __copy_atoms(struct mp4mux_list_head *src_list, mp4_atom_t *par
 	return 0;
 }
 
-static ngx_int_t mp4_clone(mp4_file_t *src, mp4_file_t *dst)
+static ngx_int_t mp4_clone(mp4_file_t *src, mp4_file_t *dst, ngx_pool_t *pool)
 {
 	dst->log = src->log;
-	dst->pool = src->pool;
+	dst->pool = pool;
 	MP4MUX_INIT_LIST_HEAD(&dst->atoms);
 	MP4MUX_INIT_LIST_HEAD(&dst->atoms_tail);
 	return __copy_atoms(&src->atoms, NULL, &dst->atoms, dst);
@@ -3626,7 +3579,7 @@ static ngx_int_t __build_chain(ngx_http_mp4mux_ctx_t *ctx, struct mp4mux_list_he
 			"build_header: %s %i", atom_name, ngx_buf_size(b));
 
 		b->tag = (ngx_buf_tag_t) &ngx_http_mp4mux_module;
-
+		b->num = MP4MUX_HDR_NUM;
 
 		if (*out)
 			(*last)->next = tl;
