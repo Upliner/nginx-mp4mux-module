@@ -371,6 +371,8 @@ typedef struct ngx_http_mp4mux_ctx_s {
 	ngx_int_t start;
 	ngx_int_t move_meta;
 	ngx_int_t chunk_rate;
+	ngx_uint_t chunk_size;
+	bool_t chunk_complete;
 	ngx_int_t segment_ms;
 	ngx_pool_t *hdr_pool;
 	bool_t done;
@@ -1394,7 +1396,6 @@ static ngx_int_t mp4mux_send_response(ngx_http_mp4mux_ctx_t *ctx)
 		}
 		f->rdbuf_size = rdbuf_size;
 	}
-	ctx->cur_trak = 0;
 
 	// Calculate ETag
 	etag = ngx_list_push(&r->headers_out.headers);
@@ -1536,10 +1537,12 @@ static ngx_int_t mp4mux_send_mp4(ngx_http_mp4mux_ctx_t *ctx)
 		if (ctx->mp4_src[i]->file.directio) {
 			if (mp4mux_seek(ctx->mp4_src[i], ctx->mp4_src[i]->mdat_pos) != NGX_OK)
 				return NGX_HTTP_INTERNAL_SERVER_ERROR;
-		} else {
-			ctx->mp4_src[i]->offs = ctx->mp4_src[i]->mdat_pos;
+		} else
 			ctx->mp4_src[i]->offs_buf = NGX_MAX_INT_T_VALUE;
-		}
+
+	for (ctx->cur_trak = 0; ctx->cur_trak < n; ctx->cur_trak++)
+		if (!ctx->mp4_src[ctx->cur_trak]->eof)
+			break;
 
 	r->root_tested = !r->error_page;
 
@@ -2648,15 +2651,12 @@ static ngx_int_t mp4mux_write(ngx_http_mp4mux_ctx_t *ctx)
 	ngx_chain_t *out;
 	mp4_file_t *f;
 	ngx_int_t rc = NGX_OK, i;
-	ngx_uint_t size;
 	ngx_http_request_t *r = ctx->req;
 	uint64_t sample_no;
 	uint32_t curchunk;
-	uint32_t len;
 	ngx_http_range_filter_ctx_t *rangectx;
 	ngx_http_range_t *range = NULL;
 	bool_t skipping = 0;
-	bool_t movenext;
 
 	rangectx = ngx_http_get_module_ctx(r, ngx_http_range_body_filter_module);
 	if (rangectx != NULL)
@@ -2667,40 +2667,10 @@ static ngx_int_t mp4mux_write(ngx_http_mp4mux_ctx_t *ctx)
 
 	while (ctx->cur_trak < ctx->trak_cnt) {
 		f = ctx->mp4_src[ctx->cur_trak];
-		sample_no = ctx->chunk_num*f->timescale;
-		ngx_log_debug6(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
-			"mp4mux: trak %i, chunk %i, frame %i, eof = %i, sample %i of %i",
-			ctx->cur_trak, ctx->chunk_num, f->frame_no, f->eof, f->sample_no, sample_no);
+		ngx_log_debug5(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
+			"mp4mux: trak %i, chunk %i, frame %i, eof = %i, sample %i",
+			ctx->cur_trak, ctx->chunk_num, f->frame_no, f->eof, f->sample_no);
 
-		size = 0;
-		movenext = 1;
-		curchunk = f->stsc_ptr.chunk_no;
-		while ((uint64_t)f->sample_no * ctx->chunk_rate < sample_no) {
-			len = be32toh(f->stsz->tbl[f->frame_no]);
-			#if (NGX_HAVE_FILE_AIO)
-			if (f->file.directio && f->aio) {
-				rc = mp4mux_readahead(f, size + len);
-				if (rc == NGX_ERROR) return rc;
-				if (rc == NGX_AGAIN) {
-					if (size) {
-						movenext = 0;
-						break;
-					} else
-						return NGX_AGAIN;
-				}
-			}
-			#endif
-			size += len;
-			if (mp4mux_nextframe(f) != NGX_OK)
-				return NGX_ERROR;
-			if (f->eof) break;
-			if (mp4_stsc_ptr_advance(f) != NGX_OK)
-				return NGX_ERROR;
-			if (f->stsc_ptr.chunk_no != curchunk) {
-				movenext = 0;
-				break;
-			}
-		}
 		if (range) {
 			if (rangectx->offset >= range->end) {
 				ngx_log_debug0(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
@@ -2709,21 +2679,45 @@ static ngx_int_t mp4mux_write(ngx_http_mp4mux_ctx_t *ctx)
 				return NGX_OK;
 			}
 		}
+		if (ctx->chunk_size == 0) {
+			sample_no = ctx->chunk_num*f->timescale;
+			ctx->chunk_complete = 1;
+			curchunk = f->stsc_ptr.chunk_no;
+			while ((uint64_t)f->sample_no * ctx->chunk_rate < sample_no) {
+				ctx->chunk_size += be32toh(f->stsz->tbl[f->frame_no]);
+				if (mp4mux_nextframe(f) != NGX_OK)
+					return NGX_ERROR;
+				if (f->eof) break;
+				if (mp4_stsc_ptr_advance(f) != NGX_OK)
+					return NGX_ERROR;
+				if (f->stsc_ptr.chunk_no != curchunk) {
+					ctx->chunk_complete = 0;
+					break;
+				}
+			}
+		}
 		if (skipping) {
-			if (rangectx->offset + size <= (size_t)range->start) {
+			if (rangectx->offset + ctx->chunk_size <= (size_t)range->start) {
 				ngx_log_debug2(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
 					"mp4mux: range skip: offs %i start %i", rangectx->offset, range->start);
-				f->mdat_pos += size;
-				rangectx->offset += size;
+				f->mdat_pos += ctx->chunk_size;
+				rangectx->offset += ctx->chunk_size;
+				ctx->chunk_size = 0;
 			} else {
 				for (i = 0; i < ctx->trak_cnt; i++)
-					if (f->file.directio)
-						mp4mux_seek(f, f->mdat_pos);
+					if (f->file.directio && mp4mux_seek(ctx->mp4_src[i], ctx->mp4_src[i]->mdat_pos) != NGX_OK)
+						return NGX_ERROR;
 				skipping = 0;
 			}
 		}
 
-		if (size && !skipping) {
+		if (ctx->chunk_size) {
+			#if (NGX_HAVE_FILE_AIO)
+			if (f->file.directio && f->aio) {
+				rc = mp4mux_readahead(f, ctx->chunk_size);
+				if (rc != NGX_OK) return rc;
+			}
+			#endif
 			out = ngx_chain_get_free_buf(r->pool, &ctx->free);
 			if (!out)
 				return NGX_ERROR;
@@ -2737,10 +2731,16 @@ static ngx_int_t mp4mux_write(ngx_http_mp4mux_ctx_t *ctx)
 			if (f->file.directio) {
 				// nginx doesn't use sendfile in directio mode, it uses temporary buffers anyway
 				// use our own buffers for more effective reading and to avoid memory leaks
-				if (mp4mux_read_chain(f, out, &ctx->free, size) != NGX_OK)
+				if (mp4mux_read_chain(f, out, &ctx->free, ctx->chunk_size) != NGX_OK)
 					return NGX_ERROR;
 				b->in_file = 0;
 				b->memory = 1;
+				if (ctx->cur_trak == 0 && htobe32(*(uint32_t*)b->start) > ctx->chunk_size) {
+					ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
+						"mp4mux: error at trak %i, chunk %i, frame %i, eof = %i, sample %i, mdat_pos %i",
+						ctx->cur_trak, ctx->chunk_num, f->frame_no, f->eof, f->sample_no, f->mdat_pos);
+					return NGX_ERROR;
+				}
 			} else {
 				b->file = &f->file;
 				b->file_pos = f->mdat_pos;
@@ -2749,15 +2749,17 @@ static ngx_int_t mp4mux_write(ngx_http_mp4mux_ctx_t *ctx)
 				b->memory = 0;
 			}
 
-			f->mdat_pos += size;
+			f->mdat_pos += ctx->chunk_size;
 			b->file_last = f->mdat_pos;
 
 			rc = ngx_http_output_filter(r, out);
 
 			mp4mux_update_chains(ctx, out);
 
-			if (f->file.directio && f->offs_buf <= size)
+			if (f->file.directio && f->offs_buf <= ctx->chunk_size)
 				f->check = 1;
+
+			ctx->chunk_size = 0;
 
 			if (f->check) {
 				// Free all successfully sent buffers
@@ -2780,7 +2782,7 @@ static ngx_int_t mp4mux_write(ngx_http_mp4mux_ctx_t *ctx)
 			}
 		}
 
-		if (movenext) {
+		if (ctx->chunk_complete) {
 		    while (++ctx->cur_trak < ctx->trak_cnt && ctx->mp4_src[ctx->cur_trak]->eof) {
 				ngx_log_debug1(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
 					"mp4mux: track %i is EOF", ctx->cur_trak);
@@ -2794,13 +2796,14 @@ static ngx_int_t mp4mux_write(ngx_http_mp4mux_ctx_t *ctx)
 					ctx->cur_trak++;
 				}
 			}
-		} else if (f->stsc_ptr.chunk_no != curchunk) {
+		} else {
 			// Move to the next chunk
 			f->mdat_pos = f->co64 ?
 				be64toh(f->co->u.tbl64[f->stsc_ptr.chunk_no-1])
 				: be32toh(f->co->u.tbl[f->stsc_ptr.chunk_no-1]);
-			if (f->file.directio)
-				mp4mux_seek(f, f->mdat_pos);
+			if (f->file.directio && !skipping && f->mdat_pos != f->offs)
+				if (mp4mux_seek(f, f->mdat_pos) != NGX_OK)
+					return NGX_ERROR;
 			ngx_log_debug2(NGX_LOG_DEBUG_HTTP, f->log, 0,
 				"switched to new chunk %i, offs = %i", f->stsc_ptr.chunk_no, f->mdat_pos);
 		}
@@ -3485,8 +3488,6 @@ static ngx_int_t mp4_alloc_chunks(ngx_http_mp4mux_ctx_t *ctx, mp4_atom_t **trak,
 		for (i = 0; i < ctx->trak_cnt; i++) {
 			f = ctx->mp4_src[i];
 			if (!f->eof && (uint64_t)f->sample_no * ctx->chunk_rate < (uint64_t)f->timescale * n) {
-				ngx_log_debug3(NGX_LOG_DEBUG_HTTP, ctx->req->connection->log, 0,
-					"chunk %i trak %i pos %i", n, i, pos);
 				if (ctx->mp4f.co64)
 					stco[i]->u.tbl64[stco_ptr[i]++] = pos;
 				else
@@ -3497,7 +3498,7 @@ static ngx_int_t mp4_alloc_chunks(ngx_http_mp4mux_ctx_t *ctx, mp4_atom_t **trak,
 					samples++;
 					if (mp4mux_nextframe(f) != NGX_OK)
 						return NGX_ERROR;
-				} while (!f->eof && (uint64_t)f->sample_no * ctx->chunk_rate <= (uint64_t)f->timescale * n);
+				} while (!f->eof && (uint64_t)f->sample_no * ctx->chunk_rate < (uint64_t)f->timescale * n);
 				if (samples != prev_samples[i]) {
 					stsc[i]->tbl[stsc_ptr[i]].first_chunk = htobe32(stco_ptr[i]);
 					stsc[i]->tbl[stsc_ptr[i]].sample_cnt = htobe32(samples);
