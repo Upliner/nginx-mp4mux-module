@@ -2181,6 +2181,7 @@ static ngx_int_t mp4mux_hls_send_segment(ngx_http_mp4mux_ctx_t *ctx)
 			return NGX_HTTP_NOT_FOUND;
 		}
 		// Move to segment start
+		ctx->mp4_src[n]->offs = 0;
 		if (ctx->hls_seg > 1) {
 			sample_pos = (ctx->hls_seg - 1) * ctx->segment_ms * ctx->mp4_src[n]->timescale / 1000;
 
@@ -2368,7 +2369,6 @@ static ngx_int_t mp4mux_hls_write(ngx_http_mp4mux_ctx_t *ctx)
 			}
 			mp4 = ctx->mp4_src[ctx->cur_trak];
 			// Init
-
 			sf_len_ptr = ((u_char*)&sf_len) + mp4->hls_ctx->sf_len - 4;
 			len = be32toh(mp4->stsz->tbl[mp4->frame_no]);
 			#if (NGX_HAVE_FILE_AIO)
