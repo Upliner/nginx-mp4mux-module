@@ -8,5 +8,5 @@ Use output_buffers instead of mp4mux_rdbuf_size?
 
 Cache:
 More debugging
-Ability to skip locked cache entries
+Hashtable
 Posix /dev/shm and sysV shmget support
