@@ -284,19 +284,22 @@ typedef struct {
 typedef struct mp4mux_cache_entry_s mp4mux_cache_entry_t;
 
 typedef struct {
+	mp4mux_cache_entry_t **hashtable;
 	u_char *start, *end;
 	u_char *write_pos;
 	mp4mux_cache_entry_t *oldest, *newest;
+	uint32_t hash_mask;
 } mp4mux_cache_header_t;
 
 struct mp4mux_cache_entry_s {
 	mp4mux_cache_entry_t *next;
+	mp4mux_cache_entry_t *hash_next;
 	u_char *start, *end;
 	mp4_atom_hdr_t *hdr;
 	ngx_atomic_t lock;
 	size_t file_size;
 	time_t file_mtime;
-	uint32_t fname_crc;
+	uint32_t fname_hash;
 	uint32_t fname_len;
 	u_char fname[0];
 };
@@ -430,9 +433,10 @@ typedef struct {
 } ngx_http_mp4mux_conf_t;
 
 typedef struct {
-	size_t    cache_size;
-	ngx_int_t cache_maxskip;
 	ngx_shm_zone_t *cache_zone;
+	size_t cache_size;
+	size_t cache_hash_size;
+	ngx_int_t cache_maxskip;
 } ngx_http_mp4mux_main_conf_t;
 
 /* These two structs must be kept in sync with ngx_http_range_filter_module.c
@@ -544,9 +548,16 @@ static ngx_command_t  ngx_http_mp4mux_commands[] = {
 	  offsetof(ngx_http_mp4mux_main_conf_t, cache_size),
 	  NULL },
 
-	{ ngx_string("mp4mux_cache_maxskip"),
+	{ ngx_string("mp4mux_cache_hash_size"),
 	  NGX_HTTP_MAIN_CONF|NGX_CONF_TAKE1,
 	  ngx_conf_set_size_slot,
+	  NGX_HTTP_MAIN_CONF_OFFSET,
+	  offsetof(ngx_http_mp4mux_main_conf_t, cache_hash_size),
+	  NULL },
+
+	{ ngx_string("mp4mux_cache_maxskip"),
+	  NGX_HTTP_MAIN_CONF|NGX_CONF_TAKE1,
+	  ngx_conf_set_num_slot,
 	  NGX_HTTP_MAIN_CONF_OFFSET,
 	  offsetof(ngx_http_mp4mux_main_conf_t, cache_maxskip),
 	  NULL },
@@ -3622,9 +3633,13 @@ static ngx_chain_t *mp4_build_chain(ngx_http_mp4mux_ctx_t *ctx, struct mp4mux_li
 // Cache
 static ngx_int_t mp4mux_cache_init(ngx_shm_zone_t *shm_zone, void *data)
 {
+	ngx_http_mp4mux_main_conf_t *conf = shm_zone->data;
 	ngx_slab_pool_t *slab = (ngx_slab_pool_t *)shm_zone->shm.addr;
 	mp4mux_cache_header_t *hdr;
 	u_char *p;
+
+	ngx_log_debug4(NGX_LOG_DEBUG_HTTP, shm_zone->shm.log, 0,
+		"mp4mux_cache_init: shm_zone=%p data=%p conf = %p, chs = %i", shm_zone, data, conf, conf->cache_hash_size);
 
 	if (data) {
 		shm_zone->data = data;
@@ -3634,16 +3649,18 @@ static ngx_int_t mp4mux_cache_init(ngx_shm_zone_t *shm_zone, void *data)
 		shm_zone->data = slab->data;
 		return NGX_OK;
 	}
-	slab->log_ctx = (u_char*)" in mp4mux cache";
-	p = shm_zone->shm.addr + sizeof(ngx_slab_pool_t);
-	hdr = (mp4mux_cache_header_t*)p;
-	p += sizeof(mp4mux_cache_header_t);
-	hdr->start = ngx_align_ptr(p, NGX_ALIGNMENT);
+	p = ngx_align_ptr(shm_zone->shm.addr + sizeof(ngx_slab_pool_t), NGX_ALIGNMENT);
+	hdr = (void*)p;
+	p = ngx_align_ptr(p + sizeof(mp4mux_cache_header_t), NGX_ALIGNMENT);
+	hdr->hashtable = (void*)p;
+	p += conf->cache_hash_size;
+	hdr->start = p;
 	hdr->end = shm_zone->shm.addr + shm_zone->shm.size;
+	hdr->hash_mask = conf->cache_hash_size/sizeof(void*)-1;
 
-	ngx_log_debug4(NGX_LOG_DEBUG_HTTP, shm_zone->shm.log, 0,
-		"mp4mux: cache init success, addr=%p hdr=%p start=%p end=%p",
-		shm_zone->shm.addr, hdr, hdr->start, hdr->end);
+	ngx_log_debug5(NGX_LOG_DEBUG_HTTP, shm_zone->shm.log, 0,
+		"mp4mux: cache init success, addr=%p hdr=%p hashtable=%p start=%p end=%p",
+		shm_zone->shm.addr, hdr, hdr->hashtable, hdr->start, hdr->end);
 
 	hdr->oldest = NULL;
 	hdr->newest = NULL;
@@ -3657,6 +3674,11 @@ static ngx_int_t mp4mux_cache_init(ngx_shm_zone_t *shm_zone, void *data)
 	hdr->root = NULL;
 	hdr->write_pos = hdr->start;
 }*/
+static void cache_del_hash(mp4mux_cache_header_t *hdr, mp4mux_cache_entry_t *e) {
+	mp4mux_cache_entry_t **he = hdr->hashtable + (e->fname_hash & hdr->hash_mask);
+	while (*he != e) he = &(*he)->hash_next;
+	*he = e->hash_next;
+}
 typedef struct {
 	mp4mux_cache_header_t *hdr;
 	mp4mux_cache_entry_t *e;
@@ -3694,6 +3716,7 @@ static mp4mux_cache_entry_t *mp4mux_cache_alloc(mp4_file_t *file, ngx_uint_t siz
 {
 	ngx_http_mp4mux_main_conf_t *conf = ngx_http_get_module_main_conf(file->req, ngx_http_mp4mux_module);
 	ngx_shm_zone_t *shm_zone = conf->cache_zone;
+	mp4mux_cache_entry_t **he;
 	ngx_slab_pool_t *slab;
 	ngx_int_t skip = 0;
 	alloc_struct as;
@@ -3737,8 +3760,10 @@ static mp4mux_cache_entry_t *mp4mux_cache_alloc(mp4_file_t *file, ngx_uint_t siz
 					as.hdr->newest = as.hdr->oldest;
 					as.hdr->oldest = as.hdr->oldest->next;
 					as.hdr->newest->next = NULL;
-				} else
+				} else {
 					as.hdr->oldest = as.hdr->oldest->next;
+					cache_del_hash(as.hdr, as.e);
+				}
 			}
 		} else
 			as.hdr->oldest = NULL;
@@ -3758,11 +3783,14 @@ static mp4mux_cache_entry_t *mp4mux_cache_alloc(mp4_file_t *file, ngx_uint_t siz
 	as.e->next = NULL;
 	as.e->start = as.alloc_start;
 	as.e->end = as.alloc_end;
-	as.e->fname_crc = ngx_crc32_short(file->fname.data, file->fname.len);
+	as.e->fname_hash = ngx_hash_key(file->fname.data, file->fname.len);
 	as.e->fname_len = file->fname.len;
 	as.e->file_size = file->file_size;
 	as.e->file_mtime = file->file_mtime;
 	ngx_memcpy(as.e->fname, file->fname.data, file->fname.len);
+	he = as.hdr->hashtable + (as.e->fname_hash & as.hdr->hash_mask);
+	as.e->hash_next = *he;
+	*he = as.e;
 	as.hdr->write_pos = as.alloc_end == as.hdr->end ? as.hdr->start : as.alloc_end;
 	ngx_shmtx_unlock(&slab->mutex);
 	return as.e;
@@ -3776,8 +3804,8 @@ static mp4mux_cache_entry_t *mp4mux_cache_fetch(mp4_file_t *file)
 {
 	ngx_slab_pool_t *slab;
 	mp4mux_cache_header_t *hdr;
-	mp4mux_cache_entry_t *e, *eprev = NULL;
-	uint32_t crc;
+	mp4mux_cache_entry_t *e;
+	uint32_t hash;
 	ngx_shm_zone_t *shm_zone = ((ngx_http_mp4mux_main_conf_t*)ngx_http_get_module_main_conf(
 		file->req, ngx_http_mp4mux_module))->cache_zone;
 
@@ -3786,19 +3814,15 @@ static mp4mux_cache_entry_t *mp4mux_cache_fetch(mp4_file_t *file)
 	slab = (ngx_slab_pool_t *)shm_zone->shm.addr;
 	hdr = shm_zone->data;
 
-	if (hdr->oldest == NULL)
-		return NULL;
 	ngx_shmtx_lock(&slab->mutex);
-	crc = ngx_crc32_short(file->fname.data, file->fname.len);
-	for (e = hdr->oldest; e != NULL; eprev = e, e = e->next) {
-		if (e->fname_crc != crc || e->fname_len != file->fname.len) continue;
+	hash = ngx_hash_key(file->fname.data, file->fname.len);
+	for (e = hdr->hashtable[hash & hdr->hash_mask]; e != NULL; e = e->hash_next) {
+		if (e->fname_hash != hash || e->fname_len != file->fname.len) continue;
 		if (ngx_memcmp(e->fname, file->fname.data, e->fname_len)) continue;
 		if (e->lock == NGX_MAX_INT_T_VALUE)
 			break;
 		if(e->file_size != file->file_size
 				|| e->file_mtime != file->file_mtime) {
-			if (eprev)
-				eprev->next = e->next;
 			break;
 		}
 		ngx_atomic_fetch_add(&e->lock, 1);
@@ -3832,11 +3856,22 @@ static void *ngx_http_mp4mux_create_main_conf(ngx_conf_t *cf)
 	if (conf == NULL) return NULL;
 
 	conf->cache_size = NGX_CONF_UNSET_SIZE;
+	conf->cache_hash_size = NGX_CONF_UNSET_SIZE;
 	conf->cache_maxskip = NGX_CONF_UNSET;
 
 	return conf;
 }
 static ngx_str_t cache_name = ngx_string("mp4mux_cache");
+static char getshift(size_t s)
+{
+	char result = 0, i;
+	for (i = 32; i; i >>= 1)
+		if (s >> i) {
+			result |= i;
+			s >>= i;
+		}
+	return result;
+}
 static char *ngx_http_mp4mux_init_main_conf(ngx_conf_t *cf, void *conf)
 {
 	ngx_http_mp4mux_main_conf_t *myconf = conf;
@@ -3847,11 +3882,28 @@ static char *ngx_http_mp4mux_init_main_conf(ngx_conf_t *cf, void *conf)
 		return NGX_CONF_ERROR;
 	}
 
+	if (myconf->cache_maxskip == NGX_CONF_UNSET)
+		myconf->cache_maxskip = 3;
+
 	if (myconf->cache_size == NGX_CONF_UNSET_SIZE)
 		myconf->cache_size = 128 * 1024 * 1024;
 
-	if (myconf->cache_maxskip == NGX_CONF_UNSET)
-		myconf->cache_maxskip = 3;
+	if (myconf->cache_size) {
+		if (myconf->cache_size < 65536)
+			myconf->cache_size = 65536;
+
+		if (myconf->cache_hash_size == NGX_CONF_UNSET_SIZE)
+			myconf->cache_hash_size = 16384;
+
+		if (myconf->cache_hash_size > myconf->cache_size / 4)
+			myconf->cache_hash_size = myconf->cache_size / 4;
+		// Adjust hash table size to be power of 2
+		myconf->cache_hash_size = 1 << getshift(myconf->cache_hash_size);
+
+		if (myconf->cache_hash_size < 128)
+			myconf->cache_hash_size = 128;
+	}
+
 
 	if (myconf->cache_size) {
 		if (!(myconf->cache_zone = ngx_shared_memory_add(cf, &cache_name, myconf->cache_size, &ngx_http_mp4mux_module))) {
@@ -3860,6 +3912,7 @@ static char *ngx_http_mp4mux_init_main_conf(ngx_conf_t *cf, void *conf)
 			return NGX_CONF_OK;
 		}
 		myconf->cache_zone->init = mp4mux_cache_init;
+		myconf->cache_zone->data = conf;
 	}
 	return NGX_CONF_OK;
 }

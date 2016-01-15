@@ -1,5 +1,4 @@
 use SHA1 in ETag
-use constants instead of magic numbers
 mp4mux_preread() is hack, get rid of it
 offs_restart is hack, get rid of it
 Use b->last instead of p in mp4mux_hls_write()?
@@ -8,5 +7,4 @@ Use output_buffers instead of mp4mux_rdbuf_size?
 
 Cache:
 More debugging
-Hashtable
 Posix /dev/shm and sysV shmget support
