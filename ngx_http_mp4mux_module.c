@@ -3758,14 +3758,18 @@ static mp4mux_cache_entry_t *mp4mux_cache_alloc(mp4_file_t *file, ngx_uint_t siz
 		}
 		if (as.e) {
 			while (as.hdr->oldest != as.e || as.wrapped-- > 1) {
-				if ((u_char*)as.e < as.write_pos || (u_char*)as.e >= as.alloc_end) {
+				if ((u_char*)as.hdr->oldest < as.write_pos || (u_char*)as.hdr->oldest >= as.alloc_end) {
+					ngx_log_debug1(NGX_LOG_DEBUG_HTTP, file->log, 0,
+						"mp4mux_cache_alloc: skipping entry %p", as.hdr->oldest);
 					as.hdr->newest->next = as.hdr->oldest;
 					as.hdr->newest = as.hdr->oldest;
 					as.hdr->oldest = as.hdr->oldest->next;
 					as.hdr->newest->next = NULL;
 				} else {
+					ngx_log_debug1(NGX_LOG_DEBUG_HTTP, file->log, 0,
+						"mp4mux_cache_alloc: deleting cache entry %p", as.hdr->oldest);
+					cache_del_hash(as.hdr, as.hdr->oldest);
 					as.hdr->oldest = as.hdr->oldest->next;
-					cache_del_hash(as.hdr, as.e);
 				}
 			}
 		} else
@@ -3819,10 +3823,20 @@ static mp4mux_cache_entry_t *mp4mux_cache_fetch(mp4_file_t *file)
 
 	ngx_shmtx_lock(&slab->mutex);
 	hash = ngx_hash_key(file->fname.data, file->fname.len);
+	ngx_log_debug2(NGX_LOG_DEBUG_HTTP, file->log, 0,
+		"mp4mux_cache_fetch: file %V hash %xd", &file->fname, hash);
 	for (e = hdr->hashtable[hash & hdr->hash_mask]; e != NULL; e = e->hash_next) {
+		ngx_log_debug1(NGX_LOG_DEBUG_HTTP, file->log, 0,
+			"mp4mux_cache_fetch: entry %p", e);
+		if ((e->fname_hash & hdr->hash_mask) != (hash & hdr->hash_mask)) {
+			ngx_log_error(NGX_LOG_ERR, file->log, 0,
+				"mp4mux cache is broken: invalid hash table entry for %V expected %xd, got %xd",
+				&file->fname, hash, e->fname_hash);
+			break;
+		}
 		if (e->fname_hash != hash || e->fname_len != file->fname.len) continue;
 		if (ngx_memcmp(e->fname, file->fname.data, e->fname_len)) continue;
-		if (e->lock == NGX_MAX_INT_T_VALUE)
+		if (e->lock == MP4MUX_CACHE_LOADING)
 			break;
 		if(e->file_size != file->file_size
 				|| e->file_mtime != file->file_mtime) {
