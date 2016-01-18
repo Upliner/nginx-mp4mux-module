@@ -375,6 +375,7 @@ typedef struct {
 	mp4_buf_t *rdbuf_cur;
 	size_t rdbuf_size;
 	size_t offs, offs_restart, offs_buf;
+	off_t sent_pos;
 
 	// Cache
 	ngx_uint_t moov_rd_size;
@@ -382,7 +383,6 @@ typedef struct {
 	#if (NGX_HAVE_FILE_AIO)
 	bool_t aio;
 	mp4_buf_t *aio_buf;
-	off_t sent_pos;
 	#endif
 
 	bool_t check;
@@ -1700,6 +1700,9 @@ static ngx_int_t mp4mux_send_mp4(ngx_http_mp4mux_ctx_t *ctx)
 		a->hdr->size = htobe32(sizeof(mp4_atom_hdr_t) + len_mdat);
 
 	mp4mux_list_add_tail(&a->entry, &ctx->atoms_head);
+
+	for (i = 0; i < n; i++)
+		 ctx->mp4_src[i]->offs = mp4_curchunk_offset(ctx->mp4_src[i]);
 
 	mp4mux_release_cache(ctx, 1);
 
