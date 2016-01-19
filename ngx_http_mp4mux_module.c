@@ -388,6 +388,7 @@ typedef struct {
 	bool_t check;
 
 	mp4_hls_ctx_t *hls_ctx;
+	unsigned dontcache:1;
 } mp4_file_t;
 
 typedef struct ngx_http_mp4mux_ctx_s {
@@ -827,8 +828,13 @@ static ngx_int_t mp4mux_finish_read(mp4_file_t *f) {
 	}
 	if (f->moov_rd_size) {
 		f->moov_rd_size = 0;
-		if (f->cache_entry)
-			ngx_atomic_cmp_set(&f->cache_entry->lock, MP4MUX_CACHE_LOADING, 1);
+		if (f->cache_entry) {
+			if (f->cache_entry->lock == MP4MUX_CACHE_LOADING)
+				f->cache_entry->lock = f->req->done ? 0 : 1;
+			else
+				ngx_log_error(NGX_LOG_ERR, f->log, 0,
+					"mp4mux_finish_read(): completed loading already loaded cache entry");
+		}
         buf = f->rdbuf_cur;
 	} else {
 		if (buf == NULL) {
@@ -1497,19 +1503,19 @@ static ngx_int_t mp4mux_send_response(ngx_http_mp4mux_ctx_t *ctx)
 		t = &f->trak;
 		if (f->moov.hdr->type != ATOM('m','o','o','v')) {
 			ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
-				"mp4mux: \"%V\" invalid moov header\n", &ctx->mp4_src[i]->fname);
+				"mp4mux: \"%V\" invalid moov header", &ctx->mp4_src[i]->fname);
 			return NGX_HTTP_INTERNAL_SERVER_ERROR;
 		}
 		if (mp4_parse_atom(f, &f->moov) != NGX_OK) {
 			ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
-				"mp4mux: \"%V\" moov parsing failed\n", &ctx->mp4_src[i]->fname);
+				"mp4mux: \"%V\" moov parsing failed", &ctx->mp4_src[i]->fname);
 			return NGX_HTTP_NOT_FOUND;
 		}
 		// Validate file
 		if (!t->mvhd || !t->trak || !t->mdhd || !t->tkhd || !t->hdlr
 				|| !t->stbl	|| !t->stsz || !t->stts || !t->stsc || !t->co) {
 			ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
-				"mp4mux: \"%V\" is invalid\n", &ctx->mp4_src[i]->fname);
+				"mp4mux: \"%V\" is invalid", &ctx->mp4_src[i]->fname);
 			return NGX_HTTP_NOT_FOUND;
 		}
 		// Init parameters
@@ -1528,7 +1534,7 @@ static ngx_int_t mp4mux_send_response(ngx_http_mp4mux_ctx_t *ctx)
 			break;
 		default:
 			ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
-				"mp4mux: invalid mdhd version in \"%V\"\n", &ctx->mp4_src[i]->fname);
+				"mp4mux: invalid mdhd version in \"%V\"", &ctx->mp4_src[i]->fname);
 			return NGX_HTTP_NOT_FOUND;
 		}
 		f->rdbuf_size = rdbuf_size;
@@ -1580,11 +1586,7 @@ static void mp4mux_release_cache_item(mp4_file_t *f, ngx_pool_t *pool) {
 		ngx_log_debug3(NGX_LOG_DEBUG_ALLOC, f->log, 0,
 			"mp4mux: release cache lock for %V, entry %p, lock=%i",
 			&f->fname, f->cache_entry, f->cache_entry->lock);
-		if (f->cache_entry->lock == MP4MUX_CACHE_LOADING)
-			ngx_log_error(NGX_LOG_ERR, f->log, 0,
-				"mp4mux: release cache while loading for %V, entry %p",
-				&f->fname, f->cache_entry);
-		if (!ngx_atomic_cmp_set(&f->cache_entry->lock, MP4MUX_CACHE_LOADING, 0))
+		if (f->cache_entry->lock != MP4MUX_CACHE_LOADING)
 			ngx_atomic_fetch_add(&f->cache_entry->lock, -1);
 		f->cache_entry = NULL;
 	} else if (pool) {
@@ -1790,6 +1792,7 @@ static void mp4mux_cleanup(void *data)
 		ctx->hdr_pool = NULL;
 	}
 	mp4mux_release_cache(ctx, 0);
+	ctx->req->done = 1;
 }
 static ngx_int_t mp4mux_hls_get_baseuri(ngx_http_request_t *r, ngx_http_variable_value_t *v, uintptr_t data)
 {
@@ -3240,7 +3243,8 @@ static ngx_int_t mp4_parse(mp4_file_t *mp4f)
 			if (mp4mux_seek(mp4f, mp4f->offs_restart) != NGX_OK)
 				return NGX_HTTP_INTERNAL_SERVER_ERROR;
 			size_aligned = ngx_align(mp4f->offs_restart + size, SECTOR_SIZE) - (mp4f->offs_restart & ~(SECTOR_SIZE-1));
-			mp4f->cache_entry = mp4mux_cache_alloc(mp4f, size_aligned);
+			if (!mp4f->dontcache)
+				mp4f->cache_entry = mp4mux_cache_alloc(mp4f, size_aligned);
 			if (mp4f->cache_entry) {
 				buf = mp4f->cache_entry->start;
 				mp4f->cache_entry->hdr = (mp4_atom_hdr_t*)(buf + (mp4f->offs_restart & (SECTOR_SIZE-1)));
@@ -3258,7 +3262,7 @@ static ngx_int_t mp4_parse(mp4_file_t *mp4f)
 			if (n != NGX_OK)
 				return NGX_HTTP_INTERNAL_SERVER_ERROR;
 			if (mp4f->cache_entry)
-				ngx_atomic_cmp_set(&mp4f->cache_entry->lock, MP4MUX_CACHE_LOADING, 1);
+				mp4f->cache_entry->lock = 1;
 			return NGX_OK;
 		} else {
 			if (size != 1) size64 = size;
@@ -3855,8 +3859,12 @@ static mp4mux_cache_entry_t *mp4mux_cache_fetch(mp4_file_t *file)
 		}
 		if (e->fname_hash != hash || e->fname_len != file->fname.len) continue;
 		if (ngx_memcmp(e->fname, file->fname.data, e->fname_len)) continue;
-		if (e->lock == MP4MUX_CACHE_LOADING)
+		if (e->lock == MP4MUX_CACHE_LOADING) {
+			// Another process is loading this cache entry, but we can't get a signal when load gets done
+			// file->dontcache will prevent this process from creating duplicate cache entries
+			file->dontcache = 1;
 			break;
+		}
 		if(e->file_size != file->file_size
 				|| e->file_mtime != file->file_mtime) {
 			break;
