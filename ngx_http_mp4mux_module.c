@@ -1580,6 +1580,10 @@ static void mp4mux_release_cache_item(mp4_file_t *f, ngx_pool_t *pool) {
 		ngx_log_debug3(NGX_LOG_DEBUG_ALLOC, f->log, 0,
 			"mp4mux: release cache lock for %V, entry %p, lock=%i",
 			&f->fname, f->cache_entry, f->cache_entry->lock);
+		if (f->cache_entry->lock == MP4MUX_CACHE_LOADING)
+			ngx_log_error(NGX_LOG_ERR, f->log, 0,
+				"mp4mux: release cache while loading for %V, entry %p",
+				&f->fname, f->cache_entry);
 		if (!ngx_atomic_cmp_set(&f->cache_entry->lock, MP4MUX_CACHE_LOADING, 0))
 			ngx_atomic_fetch_add(&f->cache_entry->lock, -1);
 		f->cache_entry = NULL;
