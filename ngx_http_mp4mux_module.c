@@ -856,7 +856,7 @@ static ngx_int_t mp4mux_finish_read(mp4_file_t *f) {
 			return NGX_ERROR;
 		}
 		buf = mp4mux_list_entry(buf->entry.next, mp4_buf_t, entry);
-	};
+	}
 	return NGX_OK;
 }
 static void ngx_http_mp4mux_read_handler(ngx_event_t *ev) {
@@ -3679,6 +3679,7 @@ static ngx_int_t mp4mux_cache_init(ngx_shm_zone_t *shm_zone, void *data)
 	hdr = (void*)p;
 	p = ngx_align_ptr(p + sizeof(mp4mux_cache_header_t), NGX_ALIGNMENT);
 	hdr->hashtable = (void*)p;
+	ngx_memzero(p, conf->cache_hash_size);
 	p += conf->cache_hash_size;
 	hdr->start = p;
 	hdr->end = shm_zone->shm.addr + shm_zone->shm.size;
