@@ -1421,8 +1421,14 @@ static ngx_int_t mp4mux_read_moov(mp4_file_t *f, u_char *data, ssize_t size) {
 	} else rc = NGX_OK;
 	if (rc < 0)
 		return rc;
-	if (rc != size)
+	if (f->offs + size > f->file_size)
+		size = f->file_size - f->offs;
+	if (rc != size) {
+		ngx_log_error(NGX_LOG_ERR, f->log, 0,
+				"Unable to read moov in %V: read %i bytes, expected %i",
+				&f->fname, rc, size);
 		return NGX_ERROR;
+	}
 
 	return NGX_OK;
 }
