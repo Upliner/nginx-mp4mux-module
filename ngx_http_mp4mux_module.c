@@ -3700,9 +3700,11 @@ static ngx_int_t mp4mux_cache_init(ngx_shm_zone_t *shm_zone, void *data)
 	hdr->root = NULL;
 	hdr->write_pos = hdr->start;
 }*/
-static void cache_del_hash(mp4mux_cache_header_t *hdr, mp4mux_cache_entry_t *e) {
+static void cache_del_hash(mp4mux_cache_header_t *hdr, mp4mux_cache_entry_t *e, ngx_log_t *log) {
 	mp4mux_cache_entry_t **he = hdr->hashtable + (e->fname_hash & hdr->hash_mask);
 	while (*he != e) he = &(*he)->hash_next;
+	ngx_log_debug3(NGX_LOG_DEBUG_ALLOC, log, 0,
+		"cache_del_hash: hash %xd at %p ptr %p", e->fname_hash, he, e->hash_next);
 	*he = e->hash_next;
 }
 typedef struct {
@@ -3791,7 +3793,7 @@ static mp4mux_cache_entry_t *mp4mux_cache_alloc(mp4_file_t *file, ngx_uint_t siz
 				} else {
 					ngx_log_debug1(NGX_LOG_DEBUG_ALLOC, file->log, 0,
 						"mp4mux_cache_alloc: deleting cache entry %p", as.hdr->oldest);
-					cache_del_hash(as.hdr, as.hdr->oldest);
+					cache_del_hash(as.hdr, as.hdr->oldest, file->log);
 					as.hdr->oldest = as.hdr->oldest->next;
 				}
 			}
@@ -3821,6 +3823,8 @@ static mp4mux_cache_entry_t *mp4mux_cache_alloc(mp4_file_t *file, ngx_uint_t siz
 	he = as.hdr->hashtable + (as.e->fname_hash & as.hdr->hash_mask);
 	as.e->hash_next = *he;
 	*he = as.e;
+	ngx_log_debug2(NGX_LOG_DEBUG_ALLOC, file->log, 0,
+		"mp4mux_cache_alloc: hash %xd ptr %p", as.e->fname_hash, as.e);
 	as.hdr->write_pos = as.alloc_end == as.hdr->end ? as.hdr->start : as.alloc_end;
 	ngx_shmtx_unlock(&slab->mutex);
 	return as.e;
@@ -3853,8 +3857,8 @@ static mp4mux_cache_entry_t *mp4mux_cache_fetch(mp4_file_t *file)
 			"mp4mux_cache_fetch: entry %p", e);
 		if ((e->fname_hash & hdr->hash_mask) != (hash & hdr->hash_mask)) {
 			ngx_log_error(NGX_LOG_ERR, file->log, 0,
-				"mp4mux cache is broken: invalid hash table entry for %V expected %xd, got %xd",
-				&file->fname, hash, e->fname_hash);
+				"mp4mux cache is broken: invalid hash table entry for %V ptr %p expected %xd, got %xd",
+				&file->fname, e, hash, e->fname_hash);
 			break;
 		}
 		if (e->fname_hash != hash || e->fname_len != file->fname.len) continue;
