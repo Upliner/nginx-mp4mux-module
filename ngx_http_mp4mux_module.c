@@ -3710,7 +3710,7 @@ typedef struct {
 	mp4mux_cache_header_t *hdr;
 	mp4mux_cache_entry_t *e;
 	u_char *write_pos, *alloc_start, *alloc_end;
-	ngx_int_t wrapped;
+	u_char wrapped;
 } alloc_struct;
 static ngx_int_t __cache_alloc(alloc_struct *as, mp4_file_t *f, ngx_int_t size) {
 	ngx_log_debug3(NGX_LOG_DEBUG_ALLOC, f->log, 0,
@@ -3771,35 +3771,39 @@ static mp4mux_cache_entry_t *mp4mux_cache_alloc(mp4_file_t *file, ngx_uint_t siz
 				if (skip > conf->cache_maxskip)
 					goto err;
 				as.write_pos = as.e->end;
+				as.e = as.e->next;
+				if (!as.e)
+					goto err;
 				if (__cache_alloc(&as, file, size) != NGX_OK)
 					goto err;
-			}
-			as.e = as.e->next;
+			} else
+				as.e = as.e->next;
 			if (!as.e && as.wrapped == 1) {
 				as.e = as.hdr->oldest;
 				as.wrapped = 2;
 			}
 		}
-		if (as.e) {
-			while (as.hdr->oldest != as.e || as.wrapped-- > 1) {
-				if ((u_char*)as.hdr->oldest < as.write_pos || (u_char*)as.hdr->oldest >= as.alloc_end) {
-					ngx_log_debug1(NGX_LOG_DEBUG_ALLOC, file->log, 0,
-						"mp4mux_cache_alloc: skipping entry %p", as.hdr->oldest);
-					as.hdr->newest->next = as.hdr->oldest;
-					as.hdr->newest = as.hdr->oldest;
-					as.hdr->oldest = as.hdr->oldest->next;
-					as.hdr->newest->next = NULL;
-				} else {
-					ngx_log_debug1(NGX_LOG_DEBUG_ALLOC, file->log, 0,
-						"mp4mux_cache_alloc: deleting cache entry %p", as.hdr->oldest);
-					cache_del_hash(as.hdr, as.hdr->oldest);
-					as.hdr->oldest = as.hdr->oldest->next;
+		while (as.hdr->oldest != as.e || as.wrapped-- > 1) {
+			if ((u_char*)as.hdr->oldest < as.write_pos || (u_char*)as.hdr->oldest >= as.alloc_end) {
+				ngx_log_debug1(NGX_LOG_DEBUG_ALLOC, file->log, 0,
+					"mp4mux_cache_alloc: skipping entry %p", as.hdr->oldest);
+				if (!as.e)
+					as.e = as.hdr->oldest;
+				as.hdr->newest->next = as.hdr->oldest;
+				as.hdr->newest = as.hdr->oldest;
+				as.hdr->oldest = as.hdr->oldest->next;
+				as.hdr->newest->next = NULL;
+			} else {
+				ngx_log_debug1(NGX_LOG_DEBUG_ALLOC, file->log, 0,
+					"mp4mux_cache_alloc: deleting cache entry %p", as.hdr->oldest);
+				cache_del_hash(as.hdr, as.hdr->oldest);
+				as.hdr->oldest = as.hdr->oldest->next;
+				if (!as.hdr->oldest) {
+					as.hdr->newest = NULL;
+					break;
 				}
 			}
-		} else
-			as.hdr->oldest = NULL;
-		if (!as.hdr->oldest)
-			as.hdr->newest = NULL;
+		}
 	}
 	ngx_log_debug0(NGX_LOG_DEBUG_ALLOC, file->log, 0,
 		"mp4mux_cache_alloc: success");
