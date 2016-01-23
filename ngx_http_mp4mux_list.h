@@ -1,11 +1,7 @@
-#ifndef _LINUX_LIST_H
-#define _LINUX_LIST_H
-//#if defined(__KERNEL__) || defined(_LVM_H_INCLUDE)
-
-//#include <linux/prefetch.h>
-
+#ifndef _MP4MUX_LIST_H
+#define _MP4MUX_LIST_H
 /*
- * Simple doubly linked mp4mux_list implementation.
+ * Simple doubly linked list implementation.
  *
  * Some of the internal functions ("__xxx") are useful when
  * manipulating whole mp4mux_lists rather than single entries, as
@@ -21,7 +17,7 @@ typedef struct mp4mux_list_head {
 #define MP4MUX_LIST_HEAD_INIT(name) { &(name), &(name) }
 
 #define MP4MUX_LIST_HEAD(name) \
-	struct mp4mux_list_head name = LIST_HEAD_INIT(name)
+	mp4mux_list_t name = LIST_HEAD_INIT(name)
 
 #define MP4MUX_INIT_LIST_HEAD(ptr) do { \
 	(ptr)->next = (ptr); (ptr)->prev = (ptr); \
@@ -36,14 +32,14 @@ typedef struct mp4mux_list_head {
 
 static inline void  prefetch(void *p){}
  
-static inline void __mp4mux_list_add(struct mp4mux_list_head *new,
-			      struct mp4mux_list_head *prev,
-			      struct mp4mux_list_head *next)
+static inline void __mp4mux_list_add(mp4mux_list_t *_new,
+			      mp4mux_list_t *prev,
+			      mp4mux_list_t *next)
 {
-	next->prev = new;
-	new->next = next;
-	new->prev = prev;
-	prev->next = new;
+	next->prev = _new;
+	_new->next = next;
+	_new->prev = prev;
+	prev->next = _new;
 }
 
 /**
@@ -54,9 +50,9 @@ static inline void __mp4mux_list_add(struct mp4mux_list_head *new,
  * Insert a new entry after the specified head.
  * This is good for implementing stacks.
  */
-static inline void mp4mux_list_add(struct mp4mux_list_head *new, struct mp4mux_list_head *head)
+static inline void mp4mux_list_add(mp4mux_list_t *_new, mp4mux_list_t *head)
 {
-	__mp4mux_list_add(new, head, head->next);
+	__mp4mux_list_add(_new, head, head->next);
 }
 
 /**
@@ -67,9 +63,9 @@ static inline void mp4mux_list_add(struct mp4mux_list_head *new, struct mp4mux_l
  * Insert a new entry before the specified head.
  * This is useful for implementing queues.
  */
-static inline void mp4mux_list_add_tail(struct mp4mux_list_head *new, struct mp4mux_list_head *head)
+static inline void mp4mux_list_add_tail(mp4mux_list_t *_new, mp4mux_list_t *head)
 {
-	__mp4mux_list_add(new, head->prev, head);
+	__mp4mux_list_add(_new, head->prev, head);
 }
 
 /*
@@ -79,7 +75,7 @@ static inline void mp4mux_list_add_tail(struct mp4mux_list_head *new, struct mp4
  * This is only for internal mp4mux_list manipulation where we know
  * the prev/next entries already!
  */
-static inline void __mp4mux_list_del(struct mp4mux_list_head *prev, struct mp4mux_list_head *next)
+static inline void __mp4mux_list_del(mp4mux_list_t *prev, mp4mux_list_t *next)
 {
 	next->prev = prev;
 	prev->next = next;
@@ -90,7 +86,7 @@ static inline void __mp4mux_list_del(struct mp4mux_list_head *prev, struct mp4mu
  * @entry: the element to delete from the mp4mux_list.
  * Note: mp4mux_list_empty on entry does not return true after this, the entry is in an undefined state.
  */
-static inline void mp4mux_list_del(struct mp4mux_list_head *entry)
+static inline void mp4mux_list_del(mp4mux_list_t *entry)
 {
 	__mp4mux_list_del(entry->prev, entry->next);
 	entry->next = (void *) 0;
@@ -101,7 +97,7 @@ static inline void mp4mux_list_del(struct mp4mux_list_head *entry)
  * mp4mux_list_del_init - deletes entry from mp4mux_list and reinitialize it.
  * @entry: the element to delete from the mp4mux_list.
  */
-static inline void mp4mux_list_del_init(struct mp4mux_list_head *entry)
+static inline void mp4mux_list_del_init(mp4mux_list_t *entry)
 {
 	__mp4mux_list_del(entry->prev, entry->next);
 	MP4MUX_INIT_LIST_HEAD(entry); 
@@ -112,7 +108,7 @@ static inline void mp4mux_list_del_init(struct mp4mux_list_head *entry)
  * @mp4mux_list: the entry to move
  * @head: the head that will precede our entry
  */
-static inline void mp4mux_list_move(struct mp4mux_list_head *mp4mux_list, struct mp4mux_list_head *head)
+static inline void mp4mux_list_move(mp4mux_list_t *mp4mux_list, mp4mux_list_t *head)
 {
         __mp4mux_list_del(mp4mux_list->prev, mp4mux_list->next);
         mp4mux_list_add(mp4mux_list, head);
@@ -123,8 +119,8 @@ static inline void mp4mux_list_move(struct mp4mux_list_head *mp4mux_list, struct
  * @mp4mux_list: the entry to move
  * @head: the head that will follow our entry
  */
-static inline void mp4mux_list_move_tail(struct mp4mux_list_head *mp4mux_list,
-				  struct mp4mux_list_head *head)
+static inline void mp4mux_list_move_tail(mp4mux_list_t *mp4mux_list,
+				  mp4mux_list_t *head)
 {
         __mp4mux_list_del(mp4mux_list->prev, mp4mux_list->next);
         mp4mux_list_add_tail(mp4mux_list, head);
@@ -134,17 +130,17 @@ static inline void mp4mux_list_move_tail(struct mp4mux_list_head *mp4mux_list,
  * mp4mux_list_empty - tests whether a mp4mux_list is empty
  * @head: the mp4mux_list to test.
  */
-static inline int mp4mux_list_empty(struct mp4mux_list_head *head)
+static inline int mp4mux_list_empty(mp4mux_list_t *head)
 {
 	return head->next == head;
 }
 
-static inline void __mp4mux_list_splice(struct mp4mux_list_head *mp4mux_list,
-				 struct mp4mux_list_head *head)
+static inline void __mp4mux_list_splice(mp4mux_list_t *mp4mux_list,
+				 mp4mux_list_t *head)
 {
-	struct mp4mux_list_head *first = mp4mux_list->next;
-	struct mp4mux_list_head *last = mp4mux_list->prev;
-	struct mp4mux_list_head *at = head->next;
+	mp4mux_list_t *first = mp4mux_list->next;
+	mp4mux_list_t *last = mp4mux_list->prev;
+	mp4mux_list_t *at = head->next;
 
 	first->prev = head;
 	head->next = first;
@@ -158,7 +154,7 @@ static inline void __mp4mux_list_splice(struct mp4mux_list_head *mp4mux_list,
  * @mp4mux_list: the new mp4mux_list to add.
  * @head: the place to add it in the first mp4mux_list.
  */
-static inline void mp4mux_list_splice(struct mp4mux_list_head *mp4mux_list, struct mp4mux_list_head *head)
+static inline void mp4mux_list_splice(mp4mux_list_t *mp4mux_list, mp4mux_list_t *head)
 {
 	if (!mp4mux_list_empty(mp4mux_list))
 		__mp4mux_list_splice(mp4mux_list, head);
@@ -171,8 +167,8 @@ static inline void mp4mux_list_splice(struct mp4mux_list_head *mp4mux_list, stru
  *
  * The mp4mux_list at @mp4mux_list is reinitialised
  */
-static inline void mp4mux_list_splice_init(struct mp4mux_list_head *mp4mux_list,
-				    struct mp4mux_list_head *head)
+static inline void mp4mux_list_splice_init(mp4mux_list_t *mp4mux_list,
+				    mp4mux_list_t *head)
 {
 	if (!mp4mux_list_empty(mp4mux_list)) {
 		__mp4mux_list_splice(mp4mux_list, head);
@@ -182,7 +178,7 @@ static inline void mp4mux_list_splice_init(struct mp4mux_list_head *mp4mux_list,
 
 /**
  * mp4mux_list_entry - get the struct for this entry
- * @ptr:	the &struct mp4mux_list_head pointer.
+ * @ptr:	the &mp4mux_list_t pointer.
  * @type:	the type of the struct this is embedded in.
  * @member:	the name of the mp4mux_list_struct within the struct.
  */
@@ -191,7 +187,7 @@ static inline void mp4mux_list_splice_init(struct mp4mux_list_head *mp4mux_list,
 
 /**
  * mp4mux_list_for_each	-	iterate over a mp4mux_list
- * @pos:	the &struct mp4mux_list_head to use as a loop counter.
+ * @pos:	the &mp4mux_list_t to use as a loop counter.
  * @head:	the head for your mp4mux_list.
  */
 #define mp4mux_list_for_each(pos, head) \
@@ -200,7 +196,7 @@ static inline void mp4mux_list_splice_init(struct mp4mux_list_head *mp4mux_list,
 
 /**
  * __mp4mux_list_for_each	-	iterate over a mp4mux_list
- * @pos:	the &struct mp4mux_list_head to use as a loop counter.
+ * @pos:	the &mp4mux_list_t to use as a loop counter.
  * @head:	the head for your mp4mux_list.
  *
  * This variant differs from mp4mux_list_for_each() in that it's the
@@ -213,7 +209,7 @@ static inline void mp4mux_list_splice_init(struct mp4mux_list_head *mp4mux_list,
 
 /**
  * mp4mux_list_for_each_prev	-	iterate over a mp4mux_list backwards
- * @pos:	the &struct mp4mux_list_head to use as a loop counter.
+ * @pos:	the &mp4mux_list_t to use as a loop counter.
  * @head:	the head for your mp4mux_list.
  */
 #define mp4mux_list_for_each_prev(pos, head) \
@@ -222,8 +218,8 @@ static inline void mp4mux_list_splice_init(struct mp4mux_list_head *mp4mux_list,
         	
 /**
  * mp4mux_list_for_each_safe	-	iterate over a mp4mux_list safe against removal of mp4mux_list entry
- * @pos:	the &struct mp4mux_list_head to use as a loop counter.
- * @n:		another &struct mp4mux_list_head to use as temporary storage
+ * @pos:	the &mp4mux_list_t to use as a loop counter.
+ * @n:		another &mp4mux_list_t to use as temporary storage
  * @head:	the head for your mp4mux_list.
  */
 #define mp4mux_list_for_each_safe(pos, n, head) \
@@ -242,7 +238,4 @@ static inline void mp4mux_list_splice_init(struct mp4mux_list_head *mp4mux_list,
 	     &pos->member != (head); 					\
 	     pos = mp4mux_list_entry(pos->member.next, typeof(*pos), member),	\
 		     prefetch(pos->member.next))
-
-//#endif /* __KERNEL__ || _LVM_H_INCLUDE */
-
 #endif

@@ -6,8 +6,6 @@
 #include <ngx_config.h>
 #include <ngx_core.h>
 #include <ngx_http.h>
-#include <ngx_string.h>
-#include <ngx_files.h>
 #include <nginx.h>
 
 #if (NGX_FREEBSD)
@@ -60,7 +58,11 @@ typedef u_char bool_t;
 typedef struct {
 	uint32_t size;
 	uint32_t type;
-	u_char data[0];
+	union {
+		u_char data[0];
+		uint32_t data32[0];
+		uint64_t data64[0];
+	} u;
 } __packed mp4_atom_hdr_t;
 
 typedef struct {
@@ -290,6 +292,14 @@ typedef struct {
 } __packed mp4_atom_sidx_t;
 
 typedef struct {
+	mp4_atom_hdr_t hdr_mvex;
+	mp4_atom_hdr_t hdr_trex;
+	uint32_t version:8;
+	uint32_t flags:24;
+	uint32_t track_id;
+} __packed mp4_atom_mvex_t;
+
+typedef struct {
 	mp4mux_list_t entry;
 	u_char *data, *data_end;
 	size_t offs, offs_end;
@@ -301,11 +311,17 @@ typedef struct {
 
 struct mp4_atom_s;
 struct mp4_atom_s {
-	struct mp4mux_list_head entry;
-	struct mp4mux_list_head atoms;
+	mp4mux_list_t entry;
+	mp4mux_list_t atoms;
 	mp4_atom_hdr_t *hdr;
-	u_char data[0];
+	mp4_atom_hdr_t data[0];
 };
+
+typedef enum {
+	atom_clone_meta,
+	atom_clone_hdr,
+	atom_clone_data,
+} atom_clone_depth;
 
 typedef struct mp4_atom_s mp4_atom_t;
 
@@ -375,6 +391,7 @@ typedef struct {
 	mp4_atom_tkhd_t *tkhd;
 	mp4_atom_mdhd_v0_t *mdhd;
 	mp4_atom_hdlr_t *hdlr;
+	mp4_atom_t *minf;
 	mp4_atom_t *stbl;
 	mp4_atom_stsd_t *stsd;
 	mp4_atom_stts_t *stts;
@@ -422,6 +439,7 @@ typedef struct {
 	// Cache
 	ngx_uint_t moov_rd_size;
 	mp4mux_cache_entry_t *cache_entry;
+	u_char *moov_buf;
 	#if (NGX_HAVE_FILE_AIO)
 	bool_t aio;
 	mp4_buf_t *aio_buf;
@@ -431,6 +449,7 @@ typedef struct {
 
 	mp4_hls_ctx_t *hls_ctx;
 	unsigned dontcache:1;
+	unsigned do_copy:1;
 } mp4_file_t;
 
 typedef struct ngx_http_mp4mux_ctx_s {
@@ -508,9 +527,9 @@ static uint32_t mp4_atom_containers[] = {
 
 #define DW_0 "\0\0\0\0"
 #define DW_1 "\0\0\0\1"
-static const u_char ftyp[] = "\0\0\0\x18""ftypisom"DW_1"isomiso2";
-static const u_char styp[] = "\0\0\0\x1C""stypiso6"DW_1"isomiso6dash";
-static const u_char mvex[] = "\0\0\0\x28mvex\0\0\0\x20trex" DW_0 DW_0 DW_1 DW_0 DW_0 DW_0;
+static u_char ftyp[] = "\0\0\0\x18""ftypisom"DW_1"isomiso2";
+//static u_char styp[] = "\0\0\0\x1C""stypiso6"DW_1"isomiso6dash";
+static u_char mvex[] = "\0\0\0\x28mvex\0\0\0\x20trex" DW_0 DW_0 DW_1 DW_0 DW_0 DW_0;
 #undef DW_0
 #undef DW_1
 
@@ -555,7 +574,7 @@ static ngx_int_t mp4_atom_to_trak(mp4_atom_t *a, mp4_trak_t *t);
 static ngx_int_t mp4_parse_atom(mp4_file_t *mp4f, mp4_atom_t *atom);
 static ngx_int_t mp4_parse(mp4_file_t *f);
 static mp4_atom_t *mp4_find_atom(struct mp4mux_list_head *list, uint32_t type);
-static mp4_atom_t *mp4_clone_atom(mp4_atom_t *atom, mp4_trak_t *dst_trak, ngx_pool_t *pool);
+static mp4_atom_t *mp4_clone_atom(mp4_atom_t *atom, mp4_trak_t *dst_trak, atom_clone_depth depth, bool_t skip_stbl, ngx_pool_t *pool);
 static off_t mp4_build_atoms(mp4mux_list_t *list, ngx_log_t *log);
 static off_t mp4_alloc_chunks(ngx_http_mp4mux_ctx_t *ctx, bool_t co64);
 static ngx_int_t mp4_tkhd_update(mp4_trak_t *trak, ngx_uint_t id, uint64_t start, uint32_t old_timescale, uint32_t new_timescale);
@@ -569,6 +588,7 @@ static ngx_int_t mp4mux_send_mp4(ngx_http_mp4mux_ctx_t *ctx);
 static ngx_int_t mp4mux_hls_send_index(ngx_http_mp4mux_ctx_t *ctx);
 static ngx_int_t mp4mux_hls_send_segment(ngx_http_mp4mux_ctx_t *ctx);
 static ngx_int_t mp4mux_dash_send_manifest(ngx_http_mp4mux_ctx_t *ctx);
+static ngx_int_t mp4mux_dash_send_init(ngx_http_mp4mux_ctx_t *ctx);
 static void mp4mux_cleanup(void *data);
 
 static ngx_command_t  ngx_http_mp4mux_commands[] = {
@@ -795,6 +815,8 @@ ngx_http_mp4mux_handler(ngx_http_request_t *r)
 			n++;
 		}
 	}
+	if (n == 0)
+		return NGX_HTTP_NOT_FOUND;
 
 	if (ngx_http_arg(r, (u_char *) "start", 5, &value) == NGX_OK)
 		ctx->start = (int) (strtod((char *) value.data, NULL) * 1000);
@@ -844,6 +866,11 @@ ngx_http_mp4mux_handler(ngx_http_request_t *r)
 					"mp4mux: DASH init must have .mp4 extension \"%V\"", &value);
 				return NGX_HTTP_NOT_FOUND;
 			}
+			if (n > 1) {
+				ngx_log_error(NGX_LOG_ERR, log, 0,
+					"mp4mux: more than 1 file specified for DASH init");
+				return NGX_HTTP_NOT_FOUND;
+			}
 			p = parseint(value.data + 10, last, &ctx->dash_tkid);
 			if (p != last || ctx->dash_tkid == 0) {
 				ngx_log_error(NGX_LOG_ERR, log, 0,
@@ -856,6 +883,11 @@ ngx_http_mp4mux_handler(ngx_http_request_t *r)
 			if (ngx_memcmp(last, ".m4s", 4)) {
 				ngx_log_error(NGX_LOG_ERR, log, 0,
 					"mp4mux: DASH segment must have .m4s extension \"%V\"", &value);
+				return NGX_HTTP_NOT_FOUND;
+			}
+			if (n > 1) {
+				ngx_log_error(NGX_LOG_ERR, log, 0,
+					"mp4mux: more than 1 file specified for DASH segment");
 				return NGX_HTTP_NOT_FOUND;
 			}
 			p = parseint(value.data + 9, last, &ctx->seg_no);
@@ -1274,6 +1306,7 @@ static ngx_int_t mp4mux_open_file( mp4_file_t *f)
 
 	if ((f->cache_entry = mp4mux_cache_fetch(f))) {
 		f->moov.hdr = f->cache_entry->hdr;
+		f->do_copy = 1;
 		return NGX_OK;
 	}
 
@@ -1557,7 +1590,7 @@ static ngx_int_t mp4mux_handle_write_rc(ngx_http_request_t *r, ngx_int_t rc) {
 		} else  {
 			ngx_log_debug0(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
 				"event is active");
-		}
+ 		}
 	} else {
 		ngx_log_debug1(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
 			"mp4mux: ngx_http_output_filter() failed, rc = %i", rc);
@@ -1672,7 +1705,7 @@ static ngx_int_t mp4mux_send_response(ngx_http_mp4mux_ctx_t *ctx)
 	case FMT_HLS_INDEX:    return mp4mux_hls_send_index(ctx);
 	case FMT_HLS_SEGMENT:  return mp4mux_hls_send_segment(ctx);
 	case FMT_DASH_MANIFEST:return mp4mux_dash_send_manifest(ctx);
-	case FMT_DASH_INIT:
+	case FMT_DASH_INIT:    return mp4mux_dash_send_init(ctx);
 	case FMT_DASH_SEGMENT:
 		ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
 			"mp4mux: dash is not implemented yet");
@@ -1706,6 +1739,113 @@ static void mp4mux_release_cache(ngx_http_mp4mux_ctx_t *ctx, bool_t pfree) {
 	for (i = 0; i < ctx->trak_cnt; i++)
 		mp4mux_release_cache_item(ctx->mp4_src[i], pfree ? ctx->req->pool : NULL);
 }
+static ngx_int_t mp4_add_primitive_atom(mp4mux_list_t *list, void *data, ngx_pool_t *pool) {
+	mp4_atom_t *a = ngx_palloc(pool, sizeof(mp4_atom_t));
+	if (!a) return NGX_ERROR;
+	MP4MUX_INIT_LIST_HEAD(&a->atoms);
+	a->hdr = data;
+	mp4mux_list_add_tail(&a->entry, list);
+	return NGX_OK;
+}
+static ngx_table_elt_t *add_content_disp(ngx_http_request_t *r, ngx_int_t size) {
+	ngx_table_elt_t *cd = ngx_list_push(&r->headers_out.headers);
+	if (cd == NULL)
+		return NULL;
+	ngx_str_set(&cd->key, "Content-Disposition");
+	cd->hash = r->header_hash;
+	if (size && !(cd->value.data = ngx_pnalloc(r->pool, size)))
+		return NULL;
+	return cd;
+}
+static ngx_int_t mp4mux_dash_send_init(ngx_http_mp4mux_ctx_t *ctx)
+{
+	ngx_http_request_t *r = ctx->req;
+	ngx_table_elt_t *content_disp;
+	mp4_file_t *f = ctx->mp4_src[0];
+	atom_clone_depth acd = f->do_copy ? atom_clone_data : atom_clone_meta;
+	mp4_atom_t *moov, *a;
+	mp4_trak_t trak;
+	ngx_chain_t *out;
+	mp4_atom_mvex_t *mvex_copy;
+	static uint32_t *st_atoms = (uint32_t*)"stszsttsstscstco";
+	static uint32_t st_sizes[] = { 20, 16, 16, 16 };
+	ngx_int_t i;
+
+	MP4MUX_INIT_LIST_HEAD(&ctx->atoms_head);
+
+	// ftyp, moov
+	if (mp4_add_primitive_atom(&ctx->atoms_head, ftyp, r->pool) != NGX_OK)
+		return NGX_HTTP_INTERNAL_SERVER_ERROR;
+
+	ngx_memzero(&trak, sizeof(trak));
+	if (!(moov = mp4_clone_atom(&f->moov, &trak, acd, 1, r->pool)))
+		return NGX_HTTP_INTERNAL_SERVER_ERROR;
+
+	mp4mux_list_add_tail(&moov->entry, &ctx->atoms_head);
+
+	// mvex
+	if (!(mvex_copy = ngx_palloc(r->pool, sizeof(mvex))))
+		return NGX_HTTP_INTERNAL_SERVER_ERROR;
+	ngx_memcpy(mvex_copy, mvex, sizeof(mvex));
+	mvex_copy->track_id = htobe32(ctx->dash_tkid);
+	trak.tkhd->track_id = htobe32(ctx->dash_tkid);
+	
+	if (mp4_add_primitive_atom(&trak.trak->entry, mvex_copy, r->pool) != NGX_OK)
+		return NGX_HTTP_INTERNAL_SERVER_ERROR;
+
+	// stbl
+	trak.stbl = ngx_palloc(r->pool, sizeof(mp4_atom_t) + sizeof(mp4_atom_hdr_t));
+	MP4MUX_INIT_LIST_HEAD(&trak.stbl->atoms);
+	trak.stbl->hdr = trak.stbl->data;
+	trak.stbl->hdr->type = ATOM('s', 't', 'b', 'l');
+	mp4mux_list_add_tail(&trak.stbl->entry, &trak.minf->atoms);
+	if (f->do_copy) {
+		i = be32toh(f->trak.stsd->hdr.size);
+		trak.stsd = ngx_palloc(r->pool, i);
+		ngx_memcpy(trak.stsd, f->trak.stsd, i);
+	} else
+		trak.stsd = f->trak.stsd;
+	if (mp4_add_primitive_atom(&trak.stbl->atoms, trak.stsd, r->pool) != NGX_OK)
+		return NGX_HTTP_INTERNAL_SERVER_ERROR;
+	for (i = 0; i < (ngx_int_t)(sizeof(st_sizes) / sizeof(st_sizes[0])); i++) {
+		a = ngx_pcalloc(r->pool, sizeof(mp4_atom_t) + st_sizes[i]);
+		MP4MUX_INIT_LIST_HEAD(&a->atoms);
+		a->hdr = a->data;
+		a->hdr->type = st_atoms[i];
+		a->hdr->size = htobe32(st_sizes[i]);
+		mp4mux_list_add_tail(&a->entry, &trak.stbl->atoms);
+	}
+	// Output
+	r->headers_out.status = NGX_HTTP_OK;
+	switch (f->trak.hdlr->subtype)
+	{
+	case ATOM('v','i','d','e'):
+		ngx_str_set(&r->headers_out.content_type, "video/mp4");
+		break;
+	case ATOM('s','o','u','n'):
+		ngx_str_set(&r->headers_out.content_type, "audio/mp4");
+		break;
+	}
+	mp4mux_release_cache(ctx, 0);
+	r->headers_out.content_type_len = r->headers_out.content_type.len;
+	if (!(content_disp = add_content_disp(r, sizeof("inline; filename=\"init-.mp4\"") + intlen(ctx->dash_tkid))))
+		return NGX_HTTP_INTERNAL_SERVER_ERROR;
+	content_disp->value.len = ngx_sprintf(content_disp->value.data,
+		"inline; filename=\"init-%i.mp4\"", ctx->dash_tkid) - content_disp->value.data;
+	i = mp4_build_atoms(&ctx->atoms_head, r->connection->log);
+	if (i < 0)
+		return NGX_HTTP_INTERNAL_SERVER_ERROR;
+	r->headers_out.content_length_n = i;
+
+	i = ngx_http_send_header(r);
+	if (i == NGX_ERROR || i > NGX_OK || r->header_only)
+		return i;
+
+	if (!(out = mp4_build_chain(ctx, &ctx->atoms_head)))
+		return NGX_ERROR;
+
+	return ngx_http_output_filter(r, out);
+}
 static ngx_int_t mp4mux_send_mp4(ngx_http_mp4mux_ctx_t *ctx)
 {
 	off_t offs = 0;
@@ -1733,21 +1873,16 @@ static ngx_int_t mp4mux_send_mp4(ngx_http_mp4mux_ctx_t *ctx)
 
 	if (!(ctx->traks = ngx_pcalloc(hdr_pool, sizeof(mp4_trak_t) * n)))
 		return NGX_HTTP_INTERNAL_SERVER_ERROR;
-	// Add ftyp
-	if (!(a = ngx_pcalloc(hdr_pool, sizeof(mp4_atom_t))))
+
+	if (mp4_add_primitive_atom(&ctx->atoms_head, ftyp, hdr_pool) != NGX_OK)
 		return NGX_HTTP_INTERNAL_SERVER_ERROR;
-	MP4MUX_INIT_LIST_HEAD(&a->atoms);
-	a->hdr = (mp4_atom_hdr_t *)ftyp;
-	mp4mux_list_add_tail(&a->entry, &ctx->atoms_head);
 
 	// Copy moov from first file
-	if (!(moov = mp4_clone_atom(&ctx->mp4_src[0]->moov, ctx->traks, hdr_pool)))
+	if (!(moov = mp4_clone_atom(&ctx->mp4_src[0]->moov, ctx->traks,
+			ctx->mp4_src[0]->do_copy ? atom_clone_data : atom_clone_meta, 0, hdr_pool)))
 		return NGX_HTTP_INTERNAL_SERVER_ERROR;
 
-	if (ctx->move_meta)
-		mp4mux_list_add_tail(&moov->entry, &ctx->atoms_head);
-	else
-		mp4mux_list_add_tail(&moov->entry, &ctx->atoms_tail);
+	mp4mux_list_add_tail(&moov->entry, ctx->move_meta ? &ctx->atoms_head : &ctx->atoms_tail);
 
 	for (i = 1; i < n; i++) {
 		// Set movie duration to the longest track duration
@@ -1757,7 +1892,8 @@ static ngx_int_t mp4mux_send_mp4(ngx_http_mp4mux_ctx_t *ctx)
 			ctx->traks->mvhd->timescale = ctx->mp4_src[i]->trak.mvhd->timescale;
 		}
 		// Copy trak atom to output mp4
-		if (!(a = mp4_clone_atom(ctx->mp4_src[i]->trak.trak, ctx->traks + i, hdr_pool)))
+		if (!(a = mp4_clone_atom(ctx->mp4_src[i]->trak.trak, ctx->traks + i,
+				ctx->mp4_src[i]->do_copy ? atom_clone_data : atom_clone_meta, 0, hdr_pool)))
 			return NGX_HTTP_INTERNAL_SERVER_ERROR;
 		mp4mux_list_add_tail(&a->entry, &moov->atoms);
 	}
@@ -1817,11 +1953,11 @@ static ngx_int_t mp4mux_send_mp4(ngx_http_mp4mux_ctx_t *ctx)
 	if (!(a = ngx_pcalloc(ctx->req->pool, sizeof(*a) + sizeof(mp4_atom_hdr_t) + (co64 ? 8 : 0))))
 		return NGX_HTTP_INTERNAL_SERVER_ERROR;
 	MP4MUX_INIT_LIST_HEAD(&a->atoms);
-	a->hdr = (mp4_atom_hdr_t *)a->data;
+	a->hdr = a->data;
 	a->hdr->type = ATOM('m', 'd', 'a', 't');
 	if (co64) {
 		a->hdr->size = htobe32(1);
-		*(uint64_t *)a->hdr->data = htobe64(sizeof(mp4_atom_hdr_t) + 8 + len_mdat);
+		a->hdr->u.data64[0] = htobe64(sizeof(mp4_atom_hdr_t) + 8 + len_mdat);
 	} else
 		a->hdr->size = htobe32(sizeof(mp4_atom_hdr_t) + len_mdat);
 
@@ -1830,7 +1966,7 @@ static ngx_int_t mp4mux_send_mp4(ngx_http_mp4mux_ctx_t *ctx)
 	for (i = 0; i < n; i++)
 		 ctx->mp4_src[i]->offs = mp4_curchunk_offset(ctx->mp4_src[i]);
 
-	mp4mux_release_cache(ctx, 1);
+	mp4mux_release_cache(ctx, 0);
 
 	r->root_tested = !r->error_page;
 
@@ -2020,12 +2156,9 @@ static ngx_int_t mp4mux_hls_send_index(ngx_http_mp4mux_ctx_t *ctx)
 	r->headers_out.status = NGX_HTTP_OK;
 	ngx_str_set(&r->headers_out.content_type, "application/vnd.apple.mpegurl");
 	r->headers_out.content_type_len = r->headers_out.content_type.len;
-	content_disp = ngx_list_push(&r->headers_out.headers);
-	if (content_disp == NULL)
+	if (!(content_disp = add_content_disp(r, 0)))
 		return NGX_HTTP_INTERNAL_SERVER_ERROR;
-	ngx_str_set(&content_disp->key, "Content-Disposition");
 	ngx_str_set(&content_disp->value, "inline; filename=\"index.m3u8\"");
-	content_disp->hash = r->header_hash;
 
 	rc = ngx_http_send_header(r);
 	if (rc == NGX_ERROR || rc > NGX_OK || r->header_only)
@@ -2117,7 +2250,7 @@ static ngx_int_t mp4mux_dash_send_manifest(ngx_http_mp4mux_ctx_t *ctx)
 				return NGX_HTTP_NOT_FOUND;
 			o->buf->last = ngx_sprintf(o->buf->last, dash_mpd_adapt_audio,
 				ctx->cur_trak + 1,
-				ad.chanconf + 1);
+				ad.chanconf);
 			dash_write_segm(o->buf, len, conf->segment_ms, &prefix);
 			o->buf->last = ngx_sprintf(o->buf->last, dash_mpd_repr_audio,
 				ctx->cur_trak + 1,
@@ -2150,12 +2283,9 @@ static ngx_int_t mp4mux_dash_send_manifest(ngx_http_mp4mux_ctx_t *ctx)
 	r->headers_out.status = NGX_HTTP_OK;
 	ngx_str_set(&r->headers_out.content_type, "application/dash+xml");
 	r->headers_out.content_type_len = r->headers_out.content_type.len;
-	content_disp = ngx_list_push(&r->headers_out.headers);
-	if (content_disp == NULL)
+	if (!(content_disp = add_content_disp(r, 0)))
 		return NGX_HTTP_INTERNAL_SERVER_ERROR;
-	ngx_str_set(&content_disp->key, "Content-Disposition");
 	ngx_str_set(&content_disp->value, "inline; filename=\"manifest.mpd\"");
-	content_disp->hash = r->header_hash;
 
 	rc = ngx_http_send_header(r);
 	if (rc == NGX_ERROR || rc > NGX_OK || r->header_only)
@@ -2168,7 +2298,7 @@ static ngx_int_t mp4mux_dash_send_manifest(ngx_http_mp4mux_ctx_t *ctx)
 }
 
 static ngx_int_t mp4_stbl_ptr_init(mp4_stbl_ptr_t *ptr, mp4_atom_hdr_t *atom, ngx_log_t *log) {
-	uint32_t entry_count = be32toh(((uint32_t*)&atom->data)[1]);
+	uint32_t entry_count = be32toh(atom->u.data32[1]);
 	if (be32toh(atom->size) != entry_count * sizeof(mp4_stbl_entry_t) + 16) {
 		ngx_log_error(NGX_LOG_ERR, log, 0,
 			"mp4_stbl_ptr_init: atom size doesn't match entry count");
@@ -2179,7 +2309,7 @@ static ngx_int_t mp4_stbl_ptr_init(mp4_stbl_ptr_t *ptr, mp4_atom_hdr_t *atom, ng
 		return NGX_ERROR;
 	}
 
-	ptr->entry = (mp4_stbl_entry_t*)&atom->data + 1;
+	ptr->entry = (mp4_stbl_entry_t*)&atom->u.data + 1;
 	ptr->end = ptr->entry + entry_count;
 	ptr->samp_left = be32toh(ptr->entry->count);
 	ptr->value = be32toh(ptr->entry->value);
@@ -2423,8 +2553,8 @@ static ngx_int_t mp4_parse_stsd_audio(ngx_log_t *log, mp4a_audio_desc *ad, mp4_a
 			"mp4mux: only AAC audio is supported, requested format id %i", ad->profile);
 		return NGX_ERROR;
 	}
-	ad->rate_idx = ((esds->data[0] & 7) << 1) | (esds->data[1] >> 7);
-	ad->chanconf = (esds->data[1] >> 3) & 0x0f;
+	ad->rate_idx = ((data[0] & 7) << 1) | (data[1] >> 7);
+	ad->chanconf = (data[1] >> 3) & 0x0f;
 	if (ad->chanconf > 7) {
 		ngx_log_error(NGX_LOG_ERR, log, 0,
 			"mp4mux: invalid channel configuration %i", ad->chanconf);
@@ -2511,26 +2641,31 @@ static ngx_int_t hls_count_packets(ngx_http_mp4mux_ctx_t *ctx, mp4_file_t *mp4)
 			if (mp4mux_nextframe(mp4) != NGX_OK)
 				return NGX_HTTP_NOT_FOUND;
 		} while (!mp4->eof);
-		// copy stss
-		len = hls_ctx->stss_data - stss_data;
-		if (len) {
-			hls_ctx->stss_data = ngx_palloc(mp4->pool, len * 4);
-			hls_ctx->stss_end = hls_ctx->stss_data + len;
-			ngx_memcpy(hls_ctx->stss_data, stss_data, len * 4);
-			hls_ctx->next_keyframe = be32toh(*stss_data)-1;
-		} else
-			hls_ctx->next_keyframe = NGX_MAX_UINT32_VALUE;
+		if (mp4->do_copy) {
+			// copy stss
+			len = hls_ctx->stss_data - stss_data;
+			if (len) {
+				hls_ctx->stss_data = ngx_palloc(mp4->pool, len * 4);
+				hls_ctx->stss_end = hls_ctx->stss_data + len;
+				ngx_memcpy(hls_ctx->stss_data, stss_data, len * 4);
+				hls_ctx->next_keyframe = be32toh(*stss_data)-1;
+			} else
+				hls_ctx->next_keyframe = NGX_MAX_UINT32_VALUE;
 
-		// copy ctts
-		if (hls_ctx->ctts) {
-			len = mp4->frame_no-frame_no;
-			i = hls_ctx->ctts_ptr.entry - hls_ctx->ctts->tbl;
-			if (i + len > be32toh(hls_ctx->ctts->entries))
-				len = be32toh(hls_ctx->ctts->entries) - i;
-			stptr = hls_ctx->ctts_ptr.entry;
-			hls_ctx->ctts_ptr.entry = ngx_palloc(mp4->pool, len * 8);
-			hls_ctx->ctts_ptr.end = hls_ctx->ctts_ptr.entry + len;
-			ngx_memcpy(hls_ctx->ctts_ptr.entry, stptr, len * 8);
+			// copy ctts
+			if (hls_ctx->ctts) {
+				len = mp4->frame_no-frame_no;
+				i = hls_ctx->ctts_ptr.entry - hls_ctx->ctts->tbl;
+				if (i + len > be32toh(hls_ctx->ctts->entries))
+					len = be32toh(hls_ctx->ctts->entries) - i;
+				stptr = hls_ctx->ctts_ptr.entry;
+				hls_ctx->ctts_ptr.entry = ngx_palloc(mp4->pool, len * 8);
+				hls_ctx->ctts_ptr.end = hls_ctx->ctts_ptr.entry + len;
+				ngx_memcpy(hls_ctx->ctts_ptr.entry, stptr, len * 8);
+			}
+		} else {
+			hls_ctx->stss_end = hls_ctx->stss_data;
+			hls_ctx->stss_data = stss_data;
 		}
 		break;
 	case PES_AUDIO:
@@ -2552,18 +2687,21 @@ static ngx_int_t hls_count_packets(ngx_http_mp4mux_ctx_t *ctx, mp4_file_t *mp4)
 	default:
 		return NGX_HTTP_INTERNAL_SERVER_ERROR;
 	}
-	// copy stsz
-	len = mp4->frame_no - frame_no;
-	mp4->chunks = ngx_palloc(mp4->pool, len * 4);
-	ngx_memcpy(mp4->chunks, mp4->trak.stsz->tbl + frame_no, len * 4);
-	mp4->chunks -= frame_no;
-	// copy stts
-	len = mp4->stts_ptr.entry - stts_save.entry + 1;
-	mp4->stts_ptr.entry = ngx_palloc(mp4->pool, len * 8);
-	mp4->stts_ptr.end = mp4->stts_ptr.entry + len;
-	ngx_memcpy(mp4->stts_ptr.entry, stts_save.entry, len * 8);
-	mp4->stts_ptr.samp_left = stts_save.samp_left;
-	mp4->stts_ptr.value = stts_save.value;
+	if (mp4->do_copy) {
+		// copy stsz
+		len = mp4->frame_no - frame_no;
+		mp4->chunks = ngx_palloc(mp4->pool, len * 4);
+		ngx_memcpy(mp4->chunks, mp4->trak.stsz->tbl + frame_no, len * 4);
+		mp4->chunks -= frame_no;
+		// copy stts
+		len = mp4->stts_ptr.entry - stts_save.entry + 1;
+		mp4->stts_ptr.entry = ngx_palloc(mp4->pool, len * 8);
+		mp4->stts_ptr.end = mp4->stts_ptr.entry + len;
+		ngx_memcpy(mp4->stts_ptr.entry, stts_save.entry, len * 8);
+		mp4->stts_ptr.samp_left = stts_save.samp_left;
+		mp4->stts_ptr.value = stts_save.value;
+	} else
+		mp4->chunks = mp4->trak.stsz->tbl;
 	// Restore pointer values
 	mp4->frame_no = frame_no;
 	mp4->sample_no = sample_no;
@@ -2589,16 +2727,10 @@ static ngx_int_t mp4mux_hls_send_segment(ngx_http_mp4mux_ctx_t *ctx)
 	r->headers_out.status = NGX_HTTP_OK;
 	ngx_str_set(&r->headers_out.content_type, "video/MP2T");
 	r->headers_out.content_type_len = r->headers_out.content_type.len;
-	content_disp = ngx_list_push(&r->headers_out.headers);
-	if (content_disp == NULL)
-		return NGX_HTTP_INTERNAL_SERVER_ERROR;
-	ngx_str_set(&content_disp->key, "Content-Disposition");
-	content_disp->value.data = ngx_pnalloc(r->pool, sizeof("inline; filename=\"seg-.ts\"") + intlen(ctx->seg_no));
-	if (content_disp->value.data == NULL)
+	if (!(content_disp = add_content_disp(r, sizeof("inline; filename=\"seg-.ts\"") + intlen(ctx->seg_no))))
 		return NGX_HTTP_INTERNAL_SERVER_ERROR;
 	content_disp->value.len = ngx_sprintf(content_disp->value.data,
 		"inline; filename=\"seg-%i.ts\"", ctx->seg_no) - content_disp->value.data;
-	content_disp->hash = r->header_hash;
 	r->headers_out.content_length_n = MPEGTS_PACKET_SIZE * 2;
 
 	if ((b = ngx_create_temp_buf(r->pool, ctx->hls_bufsize)) == NULL)
@@ -2667,7 +2799,7 @@ static ngx_int_t mp4mux_hls_send_segment(ngx_http_mp4mux_ctx_t *ctx)
 			hls_ctx->pes_typ = PES_AUDIO;
 			if (mp4_parse_stsd_audio(r->connection->log, &ad, ctx->mp4_src[n]->trak.stsd) != NGX_OK)
 				return NGX_HTTP_NOT_FOUND;
-			hls_ctx->adts_hdr = htobe32(0xfff10000 | (ad.profile - 1) << 14 | ad.rate_idx << 10 | ad.chanconf << 6);
+			hls_ctx->adts_hdr = 0xfff10000 | (ad.profile - 1) << 14 | ad.rate_idx << 10 | ad.chanconf << 6;
 			memcpy(b->last, pmt_entry_template_aac, sizeof(pmt_entry_template_aac));
 			b->last[2] = n;
 			b->last += sizeof(pmt_entry_template_aac);
@@ -2723,7 +2855,7 @@ static ngx_int_t mp4mux_hls_send_segment(ngx_http_mp4mux_ctx_t *ctx)
 		if ((rc = hls_count_packets(ctx, ctx->mp4_src[n])) != NGX_OK)
 			return rc;
 
-		mp4mux_release_cache_item(ctx->mp4_src[n], r->pool);
+		mp4mux_release_cache_item(ctx->mp4_src[n], NULL);
 
 		// Add calculated packet count to Content-Length
 		r->headers_out.content_length_n += ngx_align(hls_ctx->packet_count, 16) * MPEGTS_PACKET_SIZE;
@@ -2981,7 +3113,10 @@ static ngx_int_t mp4mux_hls_write(ngx_http_mp4mux_ctx_t *ctx)
 					return rc;
 				break;
 			case PES_AUDIO:
-				*(uint32_t*)adts_hdr = mp4->hls_ctx->adts_hdr;
+				adts_hdr[0] = mp4->hls_ctx->adts_hdr >> 24;
+				adts_hdr[1] = mp4->hls_ctx->adts_hdr >> 16;
+				adts_hdr[2] = mp4->hls_ctx->adts_hdr >> 8;
+				adts_hdr[3] = mp4->hls_ctx->adts_hdr;
 				adts_hdr[6] = 0xfc;
 				len += SIZEOF_ADTS_HEADER;
 				do {
@@ -3257,6 +3392,11 @@ static ngx_int_t mp4mux_write(ngx_http_mp4mux_ctx_t *ctx)
 			if (ctx->hdr_pool && (ctx->busy == NULL || ctx->busy->buf->num != MP4MUX_HDR_NUM)) {
 				ngx_destroy_pool(ctx->hdr_pool);
 				ctx->hdr_pool = NULL;
+				for (i = 0; i < ctx->trak_cnt; i++)
+					if (f->moov_buf) {
+						ngx_pfree(f->pool, f->moov_buf);
+						f->moov_buf = NULL;
+					}
 			}
 		}
 
@@ -3387,8 +3527,12 @@ static ngx_int_t mp4_atom_to_trak(mp4_atom_t *a, mp4_trak_t *t) {
 		if (t->hdlr || !t->trak) return NGX_ERROR;
 		t->hdlr = (mp4_atom_hdlr_t *)a->hdr;
 		break;
+	case ATOM('m', 'i', 'n', 'f'):
+		if (t->minf || !t->trak) return NGX_ERROR;
+		t->minf = a;
+		break;
 	case ATOM('s', 't', 'b', 'l'):
-		if (t->stbl || !t->trak) return NGX_ERROR;
+		if (t->stbl || !t->minf) return NGX_ERROR;
 		t->stbl = a;
 		break;
 	case ATOM('s', 't', 's', 'd'):
@@ -3434,7 +3578,7 @@ static ngx_int_t mp4_parse_atom(mp4_file_t *mp4f, mp4_atom_t *atom)
 		if (atom->hdr->type == mp4_atom_containers[i]) {
 			atom_size = be32toh(atom->hdr->size) - sizeof(*hdr);
 			for (pos = 0; pos < atom_size; pos += size) {
-				hdr = (mp4_atom_hdr_t *)(atom->hdr->data + pos);
+				hdr = (mp4_atom_hdr_t *)(atom->hdr->u.data + pos);
 				size = be32toh(hdr->size);
 
 				ngx_memcpy(atom_name, &hdr->type, 4);
@@ -3536,11 +3680,13 @@ static ngx_int_t mp4_parse(mp4_file_t *mp4f)
 				buf = mp4f->cache_entry->start;
 				mp4f->cache_entry->hdr = (mp4_atom_hdr_t*)(buf + (mp4f->offs_restart & (SECTOR_SIZE-1)));
 				mp4f->moov.hdr = mp4f->cache_entry->hdr;
+				mp4f->do_copy = 1;
 			} else {
 				buf = ngx_pmemalign(mp4f->pool, size_aligned, SECTOR_SIZE);
 				if (!buf)
 					return NGX_HTTP_INTERNAL_SERVER_ERROR;
 				mp4f->moov.hdr = (mp4_atom_hdr_t*)(buf + (mp4f->offs_restart & (SECTOR_SIZE-1)));
+				mp4f->moov_buf = buf;
 			}
 			n = mp4mux_read_moov(mp4f, buf, size_aligned);
 			mp4f->offs_restart = mp4f->offs; // Prevent unnecessary seeks
@@ -3562,7 +3708,7 @@ static ngx_int_t mp4_parse(mp4_file_t *mp4f)
 	return NGX_HTTP_NOT_FOUND;
 }
 
-static mp4_atom_t *mp4_clone_atom(mp4_atom_t *atom, mp4_trak_t *dst_trak, ngx_pool_t *pool)
+static mp4_atom_t *mp4_clone_atom(mp4_atom_t *atom, mp4_trak_t *dst_trak, atom_clone_depth depth, bool_t skip_stbl, ngx_pool_t *pool)
 {
 	mp4_atom_t *anew, *asub, *nsub;
 	ngx_int_t size = 0;
@@ -3572,30 +3718,42 @@ static mp4_atom_t *mp4_clone_atom(mp4_atom_t *atom, mp4_trak_t *dst_trak, ngx_po
 	ngx_log_debug1(NGX_LOG_DEBUG_HTTP, pool->log, 0,
 		"clone atom: %s ", atom_name);
 
-	if (mp4mux_list_empty(&atom->atoms))
-		size = be32toh(atom->hdr->size);
-	else
+	switch (depth) {
+	case atom_clone_meta: break;
+	case atom_clone_data:
+		if (mp4mux_list_empty(&atom->atoms)) {
+			size = be32toh(atom->hdr->size);
+			break;
+		}
+	case atom_clone_hdr:
 		size = sizeof(mp4_atom_hdr_t);
+	}
 
 	if (!(anew = ngx_palloc(pool, sizeof(mp4_atom_t) + size)))
 		return NULL;
 
-	anew->hdr = (mp4_atom_hdr_t*)anew->data;
-	ngx_memcpy(anew->data, atom->hdr, size);
+	if (depth == atom_clone_meta)
+		anew->hdr = atom->hdr;
+	else {
+		anew->hdr = anew->data;
+		ngx_memcpy(anew->data, atom->hdr, size);
+	}
 
-	mp4_atom_to_trak(anew, dst_trak);
+	if (mp4_atom_to_trak(anew, dst_trak) != NGX_OK)
+		return NULL;
 
 	MP4MUX_INIT_LIST_HEAD(&anew->atoms);
 
 	mp4mux_list_for_each_entry(asub, &atom->atoms, entry) {
 		switch(asub->hdr->type) {
+		case ATOM('s', 't', 'b', 'l'): if (!skip_stbl) break;
 		case ATOM('s', 't', 'c', 'o'):
 		case ATOM('c', 'o', '6', '4'):
 		case ATOM('s', 't', 's', 'c'):
 			continue;
 		}
 
-		if (!(nsub = mp4_clone_atom(asub, dst_trak, pool)))
+		if (!(nsub = mp4_clone_atom(asub, dst_trak, depth, skip_stbl, pool)))
 			return NULL;
 		mp4mux_list_add_tail(&nsub->entry, &anew->atoms);
 	}
@@ -3789,12 +3947,11 @@ static void *mp4_create_table(mp4_atom_t *stbl, uint32_t atom_type, ngx_int_t si
 	if (!a)
 		return NULL;
 
-	a->hdr = (mp4_atom_hdr_t *)a->data;
+	a->hdr = a->data;
 	a->hdr->type = atom_type;
 	MP4MUX_INIT_LIST_HEAD(&a->atoms);
 	mp4mux_list_add_tail(&a->entry, &stbl->atoms);
-
-	((uint32_t*)a->hdr->data)[0] = 0;
+	a->hdr->u.data32[0] = 0;
 	return a->hdr;
 }
 
