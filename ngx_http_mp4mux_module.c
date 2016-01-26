@@ -1905,7 +1905,7 @@ static ngx_int_t mp4mux_dash_send_segment(ngx_http_mp4mux_ctx_t *ctx)
 	sidx->hdr.size = htobe32(sidx_size);
 	sidx->hdr.type = ATOM('s','i','d','x');
 	sidx->entry_count = htobe16(1);
-	sidx->ref_id = htobe32(1);
+	sidx->ref_id = htobe32(ctx->dash_tkid);
 	sidx->timescale = htobe32(f->timescale);
 	if (mp4_add_primitive_atom(&ctx->atoms_head, sidx, r->pool) != NGX_OK)
 		return NGX_HTTP_INTERNAL_SERVER_ERROR;
@@ -1935,6 +1935,7 @@ static ngx_int_t mp4mux_dash_send_segment(ngx_http_mp4mux_ctx_t *ctx)
 	if (mp4_add_simple_atom(&traf->atoms, tfdt, r->pool, 1, f->sample_no) != NGX_OK)
 		return NGX_HTTP_INTERNAL_SERVER_ERROR;
 	pts_min = f->sample_no + ctts_ptr.value;
+	pts_end = pts_min + f->stts_ptr.value;
 
 	if (f->trak.stss) {
 		// Move stss
@@ -1992,6 +1993,9 @@ static ngx_int_t mp4mux_dash_send_segment(ngx_http_mp4mux_ctx_t *ctx)
 			*ptr++ = htobe32(ctts_ptr.value);
 			if (pts < pts_min)
 				pts_min = pts;
+			pts += f->stts_ptr.value;
+			if (pts > pts_end)
+				pts_end = pts;
 		}
 		if (mp4mux_nextframe(f) != NGX_OK)
 			return NGX_HTTP_INTERNAL_SERVER_ERROR;
@@ -2003,7 +2007,6 @@ static ngx_int_t mp4mux_dash_send_segment(ngx_http_mp4mux_ctx_t *ctx)
 		}
 	}
 
-	pts_end = NGX_MAX_UINT32_VALUE;
 	if (f->trak.ctts) {
 		// Calculate minimum pts of the next segment
 		f->sample_max = pts_end;
@@ -2017,9 +2020,8 @@ static ngx_int_t mp4mux_dash_send_segment(ngx_http_mp4mux_ctx_t *ctx)
 				f->sample_max = pts;
 			f->sample_no += f->stts_ptr.value;
 		}
-	}
-	if (pts_end == NGX_MAX_UINT32_VALUE)
-		pts_end = f->sample_no + ctts_ptr.value;
+	} else
+		pts_end = f->sample_no;
 
 	ngx_log_debug3(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
 		"mp4mux_dash: seg=%i pts_min=%i pts_end=%i", ctx->seg_no, pts_min, pts_end);
