@@ -535,7 +535,8 @@ static uint32_t mp4_atom_containers[] = {
 #define DW_0 "\0\0\0\0"
 #define DW_1 "\0\0\0\1"
 static u_char ftyp[] = "\0\0\0\x20""ftypmp42"DW_1"mp41mp42isomiso2";
-static u_char styp[] = "\0\0\0\x24""stypiso6"DW_1"isomiso6dashmsdhmsix";
+static u_char ftyp_dash[] = "\0\0\0\x24""ftypmp42"DW_1"mp41mp42isomiso2dash";
+static u_char styp[] = "\0\0\0\x24stypiso6"DW_1"isomiso6dashmsdhmsix";
 static u_char mvex[] = "\0\0\0\x28mvex\0\0\0\x20trex" DW_0 DW_0 DW_1 DW_0 DW_0 DW_0;
 static u_char mfhd[] = "\0\0\0\x10mfhd" DW_0 DW_0;
 static u_char tfhd[] = "\0\0\0\x10tfhd\0\2\0\0" DW_1;
@@ -1821,7 +1822,7 @@ static ngx_int_t mp4mux_dash_send_init(ngx_http_mp4mux_ctx_t *ctx)
 	MP4MUX_INIT_LIST_HEAD(&ctx->atoms_head);
 
 	// ftyp, moov, mvex
-	if (mp4_add_primitive_atom(&ctx->atoms_head, ftyp, r->pool) != NGX_OK)
+	if (mp4_add_primitive_atom(&ctx->atoms_head, ftyp_dash, r->pool) != NGX_OK)
 		return NGX_HTTP_INTERNAL_SERVER_ERROR;
 
 	ngx_memzero(&trak, sizeof(trak));
@@ -1888,7 +1889,7 @@ static ngx_int_t mp4mux_dash_send_segment(ngx_http_mp4mux_ctx_t *ctx)
 	ngx_int_t rc;
 	uint32_t len, sample_start, frame_start, frame_count, next_keyframe;
 	uint32_t *stss_data = NULL, *stss_end = NULL, *ptr;
-	uint32_t pts_min, pts_max, pts;
+	uint32_t pts_min, pts_end, pts;
 	off_t offs_start, head_len;
 	const ngx_int_t sidx_size = sizeof(mp4_atom_sidx_t) + sizeof(mp4_sidx_entry_t);
 	const ngx_int_t moof_pos = sizeof(styp) - 1 + sidx_size;
@@ -1916,7 +1917,7 @@ static ngx_int_t mp4mux_dash_send_segment(ngx_http_mp4mux_ctx_t *ctx)
 		return NGX_HTTP_INTERNAL_SERVER_ERROR;
 	if (!(traf = mp4_add_container_atom(&moof->atoms, ATOM('t','r','a','f'), r->pool)))
 		return NGX_HTTP_INTERNAL_SERVER_ERROR;
-	if (mp4_add_primitive_atom(&traf->atoms, tfhd, r->pool) != NGX_OK)
+	if (mp4_add_simple_atom(&traf->atoms, tfhd, r->pool, 1, ctx->dash_tkid) != NGX_OK)
 		return NGX_HTTP_INTERNAL_SERVER_ERROR;
 
 	// Prepare
@@ -1934,7 +1935,6 @@ static ngx_int_t mp4mux_dash_send_segment(ngx_http_mp4mux_ctx_t *ctx)
 	if (mp4_add_simple_atom(&traf->atoms, tfdt, r->pool, 1, f->sample_no) != NGX_OK)
 		return NGX_HTTP_INTERNAL_SERVER_ERROR;
 	pts_min = f->sample_no + ctts_ptr.value;
-	pts_max = pts_min;
 
 	if (f->trak.stss) {
 		// Move stss
@@ -1993,9 +1993,6 @@ static ngx_int_t mp4mux_dash_send_segment(ngx_http_mp4mux_ctx_t *ctx)
 		}
 		if (mp4mux_nextframe(f) != NGX_OK)
 			return NGX_HTTP_INTERNAL_SERVER_ERROR;
-		pts = f->sample_no + ctts_ptr.value;
-		if (pts > pts_max)
-			pts_max = pts;
 		if (f->eof) break;
 		if (f->trak.ctts && mp4_stbl_ptr_advance(&ctts_ptr) != NGX_OK) {
 			ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
@@ -2003,7 +2000,29 @@ static ngx_int_t mp4mux_dash_send_segment(ngx_http_mp4mux_ctx_t *ctx)
 			return NGX_HTTP_NOT_FOUND;
 		}
 	}
-	sidx->entries[0].duration = htobe32(pts_max - pts_min);
+
+	pts_end = NGX_MAX_UINT32_VALUE;
+	if (f->trak.ctts) {
+		// Calculate minimum pts of the next segment
+		f->sample_max = pts_end;
+		while (f->sample_no < f->sample_max) {
+			if (mp4_stbl_ptr_advance(&f->stts_ptr) != NGX_OK) break;
+			if (mp4_stbl_ptr_advance(&ctts_ptr) != NGX_OK) break;
+			pts = f->sample_no + ctts_ptr.value;
+			if (pts < pts_end)
+				pts_end = pts;
+			if (pts < f->sample_max)
+				f->sample_max = pts;
+			f->sample_no += f->stts_ptr.value;
+		}
+	}
+	if (pts_end == NGX_MAX_UINT32_VALUE)
+		pts_end = f->sample_no + ctts_ptr.value;
+
+	ngx_log_debug3(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
+		"mp4mux_dash: seg=%i pts_min=%i pts_end=%i", ctx->seg_no, pts_min, pts_end);
+
+	sidx->entries[0].duration = htobe32(pts_end - pts_min);
 	sidx->earliest_pts = htobe32(pts_min);
 
 	// mdat
@@ -2025,7 +2044,7 @@ static ngx_int_t mp4mux_dash_send_segment(ngx_http_mp4mux_ctx_t *ctx)
 	if (!(content_disp = add_content_disp(r, sizeof("inline; filename=\"seg--.m4s\"") + intlen(ctx->seg_no) + intlen(ctx->dash_tkid))))
 		return NGX_HTTP_INTERNAL_SERVER_ERROR;
 	content_disp->value.len = ngx_sprintf(content_disp->value.data,
-		"inline; filename=\"seg-%i-%i.m4s\"",  + intlen(ctx->seg_no), intlen(ctx->dash_tkid)) - content_disp->value.data;
+		"inline; filename=\"seg-%i-%i.m4s\"",  + ctx->seg_no, ctx->dash_tkid) - content_disp->value.data;
 	r->headers_out.content_length_n = head_len + f->offs - offs_start;
 
 	rc = ngx_http_send_header(r);
