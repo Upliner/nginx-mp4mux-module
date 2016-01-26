@@ -1891,6 +1891,7 @@ static ngx_int_t mp4mux_dash_send_segment(ngx_http_mp4mux_ctx_t *ctx)
 	uint32_t *stss_data = NULL, *stss_end = NULL, *ptr;
 	uint32_t pts_min, pts_end, pts;
 	off_t offs_start, head_len;
+	uint32_t keyframe_pts = NGX_MAX_UINT32_VALUE;
 	const ngx_int_t sidx_size = sizeof(mp4_atom_sidx_t) + sizeof(mp4_sidx_entry_t);
 	const ngx_int_t moof_pos = sizeof(styp) - 1 + sidx_size;
 
@@ -1906,7 +1907,6 @@ static ngx_int_t mp4mux_dash_send_segment(ngx_http_mp4mux_ctx_t *ctx)
 	sidx->entry_count = htobe16(1);
 	sidx->ref_id = htobe32(1);
 	sidx->timescale = htobe32(f->timescale);
-	sidx->entries[0].sap_params = htobe32(SIDX_SAP_START | SIDX_SAP_TYPE1);
 	if (mp4_add_primitive_atom(&ctx->atoms_head, sidx, r->pool) != NGX_OK)
 		return NGX_HTTP_INTERNAL_SERVER_ERROR;
 
@@ -1974,9 +1974,12 @@ static ngx_int_t mp4mux_dash_send_segment(ngx_http_mp4mux_ctx_t *ctx)
 		len = f->trak.stsz->tbl[f->frame_no];
 		*ptr++ = len;
 		f->offs += be32toh(len);
+		pts = f->sample_no + ctts_ptr.value;
 		if (stss_data) {
 			if (f->frame_no == next_keyframe) {
 				*ptr++ = 0;
+				if (keyframe_pts == NGX_MAX_UINT32_VALUE)
+					keyframe_pts = pts;
 				stss_data++;
 				if (stss_data < stss_end)
 					next_keyframe = be32toh(*stss_data)-1;
@@ -1985,7 +1988,6 @@ static ngx_int_t mp4mux_dash_send_segment(ngx_http_mp4mux_ctx_t *ctx)
 			} else
 				*ptr++ = htobe32(0x10000);
 		}
-		pts = f->sample_no + ctts_ptr.value;
 		if (f->trak.ctts) {
 			*ptr++ = htobe32(ctts_ptr.value);
 			if (pts < pts_min)
@@ -2024,6 +2026,12 @@ static ngx_int_t mp4mux_dash_send_segment(ngx_http_mp4mux_ctx_t *ctx)
 
 	sidx->entries[0].duration = htobe32(pts_end - pts_min);
 	sidx->earliest_pts = htobe32(pts_min);
+
+	if (keyframe_pts == NGX_MAX_UINT32_VALUE)
+		sidx->entries[0].sap_params = htobe32(SIDX_SAP_START | SIDX_SAP_TYPE6);
+	else
+		sidx->entries[0].sap_params = htobe32(((keyframe_pts == pts_min ? SIDX_SAP_START : 0)
+			| SIDX_SAP_TYPE1) + keyframe_pts - pts_min);
 
 	// mdat
 	if (!(mdat = mp4_alloc_atom(ctx->req->pool, sizeof(mp4_atom_hdr_t))))
