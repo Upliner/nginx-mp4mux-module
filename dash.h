@@ -17,7 +17,7 @@ static const char dash_mpd_adapt_video[] =
 "        id=\"%i\"\n"
 "        maxWidth=\"%i\"\n"
 "        maxHeight=\"%i\"\n"
-"        maxFrameRate=\"%i.%03i\">\n";
+"        maxFrameRate=\"%i/%i\">\n";
 static const char dash_mpd_adapt_audio[] =
 "    <AdaptationSet\n"
 "        id=\"%i\"\n"
@@ -40,12 +40,10 @@ static const char dash_mpd_repr_video[] =
 "      <Representation\n"
 "          id=\"%i\"\n"
 "          mimeType=\"video/mp4\"\n"
-"          codecs=\"avc1\"\n"
+"          codecs=\"avc1.%02uxD%02uxD%02uxD\"\n"
 "          width=\"%i\"\n"
 "          height=\"%i\"\n"
-"          frameRate=\"%i.%03i\"\n"
-"          sar=\"1:1\"\n"
-"          startWithSAP=\"1\"\n"
+"          frameRate=\"%i/%i\"\n"
 "          bandwidth=\"%i\"/>\n"
 "    </AdaptationSet>\n";
 static const char dash_mpd_repr_audio[] =
@@ -54,7 +52,7 @@ static const char dash_mpd_repr_audio[] =
 "      <Representation\n"
 "          id=\"%i\"\n"
 "          mimeType=\"audio/mp4\"\n"
-"          codecs=\"mp4a\"\n"
+"          codecs=\"mp4a.40.%i\"\n"
 "          audioSamplingRate=\"%i\"\n"
 "          startWithSAP=\"1\"\n"
 "          bandwidth=\"%i\"/>\n"
