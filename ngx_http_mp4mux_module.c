@@ -2484,8 +2484,8 @@ static ngx_int_t mp4mux_dash_send_manifest(ngx_http_mp4mux_ctx_t *ctx)
 				ad.chanconf);
 			dash_write_segm(o->buf, len, conf->segment_ms, &prefix);
 			o->buf->last = ngx_sprintf(o->buf->last, dash_mpd_repr_audio,
-				ad.profile,
 				ctx->cur_trak + 1,
+				ad.profile,
 				f->timescale,
 				ad.bitrate);
 			break;
@@ -2774,6 +2774,11 @@ static ngx_int_t mp4_parse_stsd_audio(ngx_log_t *log, mp4a_audio_desc *ad, mp4_a
 		return NGX_ERROR;
 	}
 	decconf = (esds_decconf_t*)data;
+	if (decconf->prof_ind != 0x40) {
+		ngx_log_error(NGX_LOG_ERR, log, 0,
+			"mp4mux: audio type must be MPEG-4 (0x40)");
+		return NGX_ERROR;
+	}
 	ad->bitrate = be32toh(decconf->max_bitrate);
 	data += sizeof(esds_decconf_t);
 	if (*data++ != 5 || !mp4_parse_esds_len(&data, end)) {
