@@ -2027,6 +2027,9 @@ static ngx_int_t mp4mux_dash_send_segment(ngx_http_mp4mux_ctx_t *ctx)
 	sidx->entries[0].duration = htobe32(pts_end - pts_min);
 	sidx->earliest_pts = htobe32(pts_min);
 
+	if (!f->trak.stss)
+		keyframe_pts = pts_min;
+
 	if (keyframe_pts == NGX_MAX_UINT32_VALUE)
 		sidx->entries[0].sap_params = htobe32(SIDX_SAP_START | SIDX_SAP_TYPE6);
 	else
