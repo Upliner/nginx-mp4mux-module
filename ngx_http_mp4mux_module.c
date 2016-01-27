@@ -496,6 +496,7 @@ typedef struct {
 	ngx_flag_t move_meta;
 	ngx_str_t hls_prefix;
 	ngx_str_t dash_prefix;
+	ngx_str_t allow_origin;
 	ngx_array_t *hp_lengths;
 	ngx_array_t *hp_values;
 	ngx_array_t *dp_lengths;
@@ -664,6 +665,13 @@ static ngx_command_t  ngx_http_mp4mux_commands[] = {
 	  ngx_conf_set_str_slot,
 	  NGX_HTTP_LOC_CONF_OFFSET,
 	  offsetof(ngx_http_mp4mux_conf_t, dash_prefix),
+	  NULL },
+
+	{ ngx_string("mp4mux_allow_origin"),
+	  NGX_HTTP_MAIN_CONF|NGX_HTTP_SRV_CONF|NGX_HTTP_LOC_CONF|NGX_CONF_TAKE1,
+	  ngx_conf_set_str_slot,
+	  NGX_HTTP_LOC_CONF_OFFSET,
+	  offsetof(ngx_http_mp4mux_conf_t, allow_origin),
 	  NULL },
 
 	{ ngx_string("mp4mux_move_meta"),
@@ -1617,15 +1625,15 @@ static ngx_int_t mp4mux_handle_write_rc(ngx_http_request_t *r, ngx_int_t rc) {
 static ngx_int_t mp4mux_send_response(ngx_http_mp4mux_ctx_t *ctx)
 {
 	ngx_http_request_t *r = ctx->req;
+	ngx_http_mp4mux_conf_t* conf = ngx_http_get_module_loc_conf(r, ngx_http_mp4mux_module);
 	ngx_int_t i, rc, rdbuf_size;
-	ngx_table_elt_t *etag;
+	ngx_table_elt_t *hdr;
 	mp4_file_t *f;
 	mp4_trak_t *t;
 	u_char *etag_val;
 	bool_t again = 0;
 
-	rdbuf_size = ((ngx_http_mp4mux_conf_t*)ngx_http_get_module_loc_conf(r, ngx_http_mp4mux_module))->
-		rdbuf_size & ~(SECTOR_SIZE-1);
+	rdbuf_size = conf->rdbuf_size & ~(SECTOR_SIZE-1);
 	if (rdbuf_size < 32768) rdbuf_size = 32768;
 
 	for (i = 0; i < ctx->trak_cnt; i++) {
@@ -1691,19 +1699,18 @@ static ngx_int_t mp4mux_send_response(ngx_http_mp4mux_ctx_t *ctx)
 	}
 
 	// Calculate ETag
-	etag = ngx_list_push(&r->headers_out.headers);
-	if (etag == NULL)
+	if (!(hdr = ngx_list_push(&r->headers_out.headers)))
 		return NGX_HTTP_INTERNAL_SERVER_ERROR;
 
-	etag->hash = 1;
-	ngx_str_set(&etag->key, "ETag");
+	hdr->hash = 1;
+	ngx_str_set(&hdr->key, "ETag");
 
 	etag_val = ngx_pnalloc(r->pool, (NGX_OFF_T_LEN + NGX_TIME_T_LEN + 2)*(ctx->trak_cnt) + 4);
 	if (etag_val == NULL) {
-		etag->hash = 0;
+		hdr->hash = 0;
 		return NGX_HTTP_INTERNAL_SERVER_ERROR;
 	}
-	etag->value.data = etag_val;
+	hdr->value.data = etag_val;
 
 	*etag_val++ = '"';
 	for (i = 0; i < ctx->trak_cnt; i++) {
@@ -1713,8 +1720,16 @@ static ngx_int_t mp4mux_send_response(ngx_http_mp4mux_ctx_t *ctx)
 			ctx->mp4_src[i]->file_size);
 	}
 	out3b(etag_val,'/' ,'3', '"');
-	etag->value.len = etag_val - etag->value.data;
-	r->headers_out.etag = etag;
+	hdr->value.len = etag_val - hdr->value.data;
+	r->headers_out.etag = hdr;
+
+	if (conf->allow_origin.len) {
+		if (!(hdr = ngx_list_push(&r->headers_out.headers)))
+			return NGX_HTTP_INTERNAL_SERVER_ERROR;
+		ngx_str_set(&hdr->key, "Access-Control-Allow-Origin");
+		hdr->value = conf->allow_origin;
+		hdr->hash = 1;
+	}
 
 	// Call format-specific functions
 	switch (ctx->fmt) {
@@ -4707,6 +4722,7 @@ static char *ngx_http_mp4mux_merge_conf(ngx_conf_t *cf, void *parent, void *chil
 	ngx_conf_merge_value(conf->chunk_rate, prev->chunk_rate, 10);
 	ngx_conf_merge_str_value(conf->hls_prefix,  prev->hls_prefix,  "$scheme://$http_host$hls_baseuri&fmt=hls/");
 	ngx_conf_merge_str_value(conf->dash_prefix, prev->dash_prefix, "$scheme://$http_host$uri?file0=$dash_filename&fmt=dash/");
+	ngx_conf_merge_str_value(conf->allow_origin, prev->allow_origin, "");
 
 	ngx_memzero(&sc, sizeof(ngx_http_script_compile_t));
 
