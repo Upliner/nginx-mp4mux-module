@@ -1887,7 +1887,7 @@ static ngx_int_t mp4mux_dash_send_segment(ngx_http_mp4mux_ctx_t *ctx)
 	mp4_atom_trun_t *trun;
 	mp4_stbl_ptr_t ctts_ptr, stts_save;
 	ngx_int_t rc;
-	uint32_t len, sample_start, frame_start, frame_count, next_keyframe;
+	uint32_t len, sample_start, frame_start, frame_count, next_keyframe = 0;
 	uint32_t *stss_data = NULL, *stss_end = NULL, *ptr;
 	uint32_t pts_min, pts_end, pts;
 	off_t offs_start, head_len;
