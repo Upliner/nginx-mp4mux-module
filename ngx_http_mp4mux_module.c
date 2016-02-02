@@ -2499,7 +2499,7 @@ static ngx_int_t mp4mux_dash_send_manifest(ngx_http_mp4mux_ctx_t *ctx)
 	mp4_file_t *f;
 	mp4a_audio_desc ad;
 	ngx_table_elt_t *content_disp;
-	ngx_int_t rc, content_len, len, brate;
+	ngx_int_t rc, last, content_len, len, brate;
 	uint64_t frate_num, frate_den, div;
 	mp4_atom_avcC_t *avcc;
 	ngx_str_t prefix;
@@ -2560,12 +2560,25 @@ static ngx_int_t mp4mux_dash_send_manifest(ngx_http_mp4mux_ctx_t *ctx)
 				be16toh(f->trak.stsd->entry.avc1.width),
 				be16toh(f->trak.stsd->entry.avc1.height),
 				frate_num, frate_den);
-			if (ctx->seg_align) {
+			if (ctx->seg_align && !f->eof) {
 				o->buf->last = ngx_sprintf(o->buf->last, dash_mpd_segm, &prefix, &prefix);
 				mp4_stss_init(f);
-				while (!f->eof)
-					o->buf->last = ngx_sprintf(o->buf->last, dash_mpd_tl,
-						(uint64_t)mp4_nextseg(ctx, f) * 1000 / f->timescale);
+				last = mp4_nextseg(ctx, f);
+				rc = last;
+				len = 0;
+				while (1)
+					if (f->eof || (rc = mp4_nextseg(ctx, f)) != last) {
+						if (len == 0)
+							o->buf->last = ngx_sprintf(o->buf->last, dash_mpd_tl,
+								(uint64_t)last * 1000 / f->timescale);
+						else
+							o->buf->last = ngx_sprintf(o->buf->last, dash_mpd_tl_r,
+								(uint64_t)last * 1000 / f->timescale, len);
+						if (last == rc) break;
+						last = rc;
+						len = 0;
+					} else
+						len++;
 			} else
 				dash_write_segm(o->buf, len, conf->segment_ms, &prefix);
 			o->buf->last = ngx_sprintf(o->buf->last, dash_mpd_repr_video,
