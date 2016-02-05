@@ -1459,7 +1459,7 @@ static ngx_int_t mp4mux_read(mp4_file_t *f, u_char *data, size_t size, bool_t no
 			return NGX_OK;
 		else {
 			ngx_log_error(NGX_LOG_ERR, f->file.log, 0,
-				"mp4mux_read(): tried to read beyond EOF");
+				"mp4mux_read(): tried to read beyond EOF file=%p offs=%z size=%z", f, f->offs, f->file_size);
 			return NGX_ERROR;
 		}
 	}
@@ -3058,14 +3058,19 @@ static ngx_int_t hls_count_packets(ngx_http_mp4mux_ctx_t *ctx, mp4_file_t *mp4)
 		ngx_memcpy(mp4->stts_ptr.entry, stts_save.entry, len * 8);
 		mp4->stts_ptr.samp_left = stts_save.samp_left;
 		mp4->stts_ptr.value = stts_save.value;
-	} else
+	} else {
 		mp4->chunks = mp4->trak.stsz->tbl;
+		mp4->stts_ptr = stts_save;
+	}
 	// Restore pointer values
 	mp4->frame_no = frame_no;
 	mp4->sample_no = sample_no;
 	mp4->eof = 0;
 	mp4->file_size = offs; // virtually truncate the file to avoid excessive reads
 	hls_calcdts(mp4);
+
+	ngx_log_debug2(NGX_LOG_DEBUG_HTTP, mp4->file.log, 0,
+		"hls_count_packets: %O packets for %V", hls_ctx->packet_count, &mp4->fname);
 
 	mp4mux_release_cache_item(mp4, NULL);
 	mp4->req->headers_out.content_length_n += ngx_align(hls_ctx->packet_count, 16) * MPEGTS_PACKET_SIZE;
@@ -3455,7 +3460,7 @@ static ngx_int_t mp4mux_hls_write(ngx_http_mp4mux_ctx_t *ctx)
 			#endif
 			frame_end = mp4->offs + len;
 			ngx_log_debug6(NGX_LOG_DEBUG_HTTP, log, 0,
-				"mp4mux: track %i frame %i, sample %i, offs: %i, len: %i, ctts = %i",
+				"mp4mux: track %i frame %uD, sample %uD, offs: %z, len: %z, ctts = %uD",
 				ctx->cur_trak, mp4->frame_no, mp4->sample_no, mp4->offs, len,
 				mp4->hls_ctx->ctts_ptr.value);
 			///// Write MPEG-TS packet
@@ -3588,7 +3593,7 @@ static ngx_int_t mp4mux_hls_write(ngx_http_mp4mux_ctx_t *ctx)
 					}
 					len = frame_end - mp4->offs;
 					if (mp4mux_read(mp4, p, len, 1) != NGX_OK)
-						return NGX_OK;
+						return NGX_ERROR;
 					p += len;
 					// Move to the next frame
 					rc = hls_nextframe(mp4);
