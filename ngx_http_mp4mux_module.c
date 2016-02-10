@@ -846,6 +846,7 @@ ngx_http_mp4mux_handler(ngx_http_request_t *r)
 
 			ctx->mp4_src[n]->fname = fname;
 			ctx->mp4_src[n]->basename = value;
+			ctx->mp4_src[n]->file.log = r->connection->log;
 
 			n++;
 		}
@@ -1330,7 +1331,6 @@ static ngx_int_t mp4mux_open_file(mp4_file_t *f)
 	f->file_mtime = of.mtime;
 	f->file.fd = of.fd;
 	f->file.name = f->fname;
-	f->file.log = f->req->connection->log;
 	f->file.directio = of.is_directio;
 
 	if (f->file_size < 10) {
