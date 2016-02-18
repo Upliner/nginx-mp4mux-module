@@ -21,6 +21,7 @@ static const char dash_mpd_adapt_video[] =
 static const char dash_mpd_adapt_audio[] =
 "    <AdaptationSet\n"
 "        id=\"%i\"\n"
+"        lang=\"%V\"\n"
 "        segmentAlignment=\"true\">\n"
 "      <AudioChannelConfiguration\n"
 "          schemeIdUri=\"urn:mpeg:dash:23003:3:audio_channel_configuration:2011\"\n"
@@ -34,9 +35,10 @@ static const char dash_mpd_segm[] =
 "        <SegmentTimeline>\n";
 static const char dash_mpd_tl_r[] = "          <S d=\"%i\" r=\"%i\"/>\n";
 static const char dash_mpd_tl[]   = "          <S d=\"%i\"/>\n";
-static const char dash_mpd_repr_video[] =
+static const char dash_mpd_segm_tail[] =
 "        </SegmentTimeline>\n"
-"      </SegmentTemplate>\n"
+"      </SegmentTemplate>\n";
+static const char dash_mpd_repr_video[] =
 "      <Representation\n"
 "          id=\"%i\"\n"
 "          mimeType=\"video/mp4\"\n"
@@ -44,19 +46,16 @@ static const char dash_mpd_repr_video[] =
 "          width=\"%uD\"\n"
 "          height=\"%uD\"\n"
 "          frameRate=\"%uL/%uL\"\n"
-"          bandwidth=\"%i\"/>\n"
-"    </AdaptationSet>\n";
+"          bandwidth=\"%i\"/>\n";
 static const char dash_mpd_repr_audio[] =
-"        </SegmentTimeline>\n"
-"      </SegmentTemplate>\n"
 "      <Representation\n"
 "          id=\"%i\"\n"
 "          mimeType=\"audio/mp4\"\n"
 "          codecs=\"mp4a.40.%uD\"\n"
 "          audioSamplingRate=\"%uD\"\n"
 "          startWithSAP=\"1\"\n"
-"          bandwidth=\"%uD\"/>\n"
-"    </AdaptationSet>\n";
+"          bandwidth=\"%uD\"/>\n";
+static const char dash_mpd_adapt_tail[] = "    </AdaptationSet>\n";
 static u_char dash_mpd_footer[] = "  </Period>\n</MPD>\n";
 
 #endif
