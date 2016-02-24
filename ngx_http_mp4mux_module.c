@@ -3757,7 +3757,7 @@ static ngx_int_t mp4mux_hls_send_segment(ngx_http_mp4mux_ctx_t *ctx)
 	mp4_hls_ctx_t *hls_ctx;
 	ngx_str_t str;
 	ngx_int_t rc, n;
-	uint32_t tmp, sample_pos, sample_max, timescale = 0;
+	uint32_t tmp, sample_pos = 0, sample_max = 0, timescale = 0;
 	ngx_buf_t *b;
 	u_char *p;
 	u_char vid = PES_VIDEO, aid = PES_AUDIO;
@@ -3859,18 +3859,23 @@ static ngx_int_t mp4mux_hls_send_segment(ngx_http_mp4mux_ctx_t *ctx)
 					return NGX_HTTP_NOT_FOUND;
 				}
 			}
+		if (!timescale)
+			ctx->seg_align = 0;
 		for (n = 0; n < ctx->trak_cnt; n++)
 			if (!ctx->mp4_src[n]->trak.stss) {
-				if (timescale) {
-					mp4_ff_samples(ctx->mp4_src[n], ((uint64_t)sample_pos * ctx->mp4_src[n]->timescale / timescale) - ctx->mp4_src[n]->sample_no);
-					if (mp4_seek_to_frame(ctx->mp4_src[n]) != NGX_OK)
-						return NGX_HTTP_INTERNAL_SERVER_ERROR;
-					tmp = (uint64_t)sample_max * ctx->mp4_src[n]->timescale / timescale;
-					if (tmp < ctx->mp4_src[n]->sample_max)
-						ctx->mp4_src[n]->sample_max = tmp;
-					if (ctx->mp4_src[n]->sample_no >= ctx->mp4_src[n]->sample_max)
-						ctx->mp4_src[n]->eof = 1;
+				if (!ctx->seg_align) {
+					sample_pos = ctx->mp4_src[n]->sample_no;
+					timescale = ctx->mp4_src[n]->timescale;
+					sample_max = ctx->seg_no * ctx->segment_ms * timescale / 1000;
 				}
+				mp4_ff_samples(ctx->mp4_src[n], ((uint64_t)sample_pos * ctx->mp4_src[n]->timescale / timescale) - ctx->mp4_src[n]->sample_no);
+				if (mp4_seek_to_frame(ctx->mp4_src[n]) != NGX_OK)
+					return NGX_HTTP_INTERNAL_SERVER_ERROR;
+				tmp = (uint64_t)sample_max * ctx->mp4_src[n]->timescale / timescale;
+				if (tmp < ctx->mp4_src[n]->sample_max)
+					ctx->mp4_src[n]->sample_max = tmp;
+				if (ctx->mp4_src[n]->sample_no >= ctx->mp4_src[n]->sample_max)
+					ctx->mp4_src[n]->eof = 1;
 				if ((rc = hls_count_packets(ctx, ctx->mp4_src[n])) != NGX_OK)
 					return rc;
 			}
