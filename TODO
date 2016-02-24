@@ -1,4 +1,3 @@
-use SHA1 in ETag
 mp4mux_preread() is hack, get rid of it
 offs_restart is hack, get rid of it
 Use b->last instead of p in mp4mux_hls_write()?
@@ -6,5 +5,4 @@ Make AIO read possible without mp4mux_readahead()
 Use output_buffers instead of mp4mux_rdbuf_size?
 
 Cache:
-More debugging
 Posix /dev/shm and sysV shmget support
