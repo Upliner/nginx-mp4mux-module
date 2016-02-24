@@ -2759,7 +2759,7 @@ static ngx_int_t mp4mux_hls_send_master(ngx_http_mp4mux_ctx_t *ctx)
 	trak_id = 0;
 	part = &mctx->list->part;
 	fg = part->elts;
-	for (i = 0;; i++, trak_id++) {
+	for (i = 0;; i++) {
  		if (i >= part->nelts) {
 			if (part->next == NULL)
 				break;
@@ -2777,7 +2777,7 @@ static ngx_int_t mp4mux_hls_send_master(ngx_http_mp4mux_ctx_t *ctx)
 				out.buf->last = ngx_sprintf(out.buf->last, m3u8_master_video,
 					(ngx_int_t)((uint64_t)f->file_size * 8 * f->timescale / f->sample_max),
 					avcc->prof_ind, avcc->prof_comp, avcc->level,
-					urls + trak_id);
+					urls + trak_id++);
 				mp4mux_release_cache_item(f, r->pool);
 			}
 			break;
@@ -2785,7 +2785,7 @@ static ngx_int_t mp4mux_hls_send_master(ngx_http_mp4mux_ctx_t *ctx)
 			for (j = 0; j < fg[i].n; j++) {
 				f = fg[i].mp4[j];
 				out.buf->last = ngx_sprintf(out.buf->last, m3u8_master_audio,
-					&fg[i].lang, &fg[i].lang, urls + trak_id);
+					&fg[i].lang, &fg[i].lang, urls + trak_id++);
 				mp4mux_release_cache_item(f, r->pool);
 			}
 			break;
