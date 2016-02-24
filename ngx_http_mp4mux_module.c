@@ -503,10 +503,13 @@ typedef struct {
 	ngx_flag_t move_meta;
 	ngx_flag_t seg_align;
 	ngx_str_t hls_prefix;
+	ngx_str_t hls_master_item;
 	ngx_str_t dash_prefix;
 	ngx_str_t allow_origin;
 	ngx_array_t *hp_lengths;
 	ngx_array_t *hp_values;
+	ngx_array_t *mp_lengths;
+	ngx_array_t *mp_values;
 	ngx_array_t *dp_lengths;
 	ngx_array_t *dp_values;
 } ngx_http_mp4mux_conf_t;
@@ -561,7 +564,10 @@ static const u_char m3u8_header[] =
 	"#EXT-X-MEDIA-SEQUENCE:1\n"
 	"#EXT-X-TARGETDURATION:";
 
+static const char m3u8_master_header[] = "#EXTM3U\n";
 static const char m3u8_entry[] = "#EXTINF:%i.%03i,\n%Vseg-%i.ts\n";
+static const char m3u8_master_video[] = "#EXT-X-STREAM-INF:BANDWIDTH=%i,CODECS=\"avc1.%02uxD%02uxD%02uxD\",AUDIO=\"audio\"\n%V\n";
+static const char m3u8_master_audio[] = "#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID=\"audio\",NAME=\"%V\",AUTOSELECT=YES,LANGUAGE=\"%V\",URI=\"%V\"\n";
 
 static const u_char m3u8_footer[] = "#EXT-X-ENDLIST\n";
 
@@ -617,6 +623,7 @@ static void ngx_http_mp4mux_write_handler(ngx_event_t *ev);
 static ngx_int_t mp4mux_parse_filelist(ngx_http_request_t *r, mp4mux_manifest_ctx_t *mctx);
 static ngx_int_t mp4mux_send_response(ngx_http_mp4mux_ctx_t *ctx);
 static ngx_int_t mp4mux_send_mp4(ngx_http_mp4mux_ctx_t *ctx);
+static ngx_int_t mp4mux_hls_send_master(ngx_http_mp4mux_ctx_t *ctx);
 static ngx_int_t mp4mux_hls_send_index(ngx_http_mp4mux_ctx_t *ctx);
 static ngx_int_t mp4mux_hls_send_segment(ngx_http_mp4mux_ctx_t *ctx);
 static ngx_int_t mp4mux_dash_send_complex_manifest(ngx_http_mp4mux_ctx_t *ctx);
@@ -674,6 +681,13 @@ static ngx_command_t  ngx_http_mp4mux_commands[] = {
 	  ngx_conf_set_str_slot,
 	  NGX_HTTP_LOC_CONF_OFFSET,
 	  offsetof(ngx_http_mp4mux_conf_t, hls_prefix),
+	  NULL },
+
+	{ ngx_string("mp4mux_master_item_template"),
+	  NGX_HTTP_MAIN_CONF|NGX_HTTP_SRV_CONF|NGX_HTTP_LOC_CONF|NGX_CONF_TAKE1,
+	  ngx_conf_set_str_slot,
+	  NGX_HTTP_LOC_CONF_OFFSET,
+	  offsetof(ngx_http_mp4mux_conf_t, hls_master_item),
 	  NULL },
 
 	{ ngx_string("mp4mux_dash_prefix"),
@@ -910,7 +924,8 @@ ngx_http_mp4mux_handler(ngx_http_request_t *r)
 	if (ngx_http_arg(r, (u_char *)"fmt", 3, &value) == NGX_OK) {
 		if (value.len == 3 && ngx_memcmp(value.data, "mp4", 3) == 0)
 			ctx->fmt = FMT_MP4;
-		else if (value.len == 14 && ngx_memcmp(value.data, "hls/index.m3u8", 14) == 0)
+		else if ((value.len == 14 && ngx_memcmp(value.data, "hls/index.m3u8", 14) == 0)
+				|| (ctx->mctx != NULL && value.len == 15 && ngx_memcmp(value.data, "hls/master.m3u8", 15) == 0))
 			ctx->fmt = FMT_HLS_INDEX;
 		else if (value.len == 17 && ngx_memcmp(value.data, "dash/manifest.mpd", 17) == 0)
 			ctx->fmt = FMT_DASH_MANIFEST;
@@ -1005,17 +1020,25 @@ ngx_http_mp4mux_handler(ngx_http_request_t *r)
 	}
 
 	if (ctx->mctx != NULL) {
-		if (ctx->fmt != FMT_DASH_MANIFEST) {
+		if (ctx->fmt != FMT_DASH_MANIFEST && ctx->fmt != FMT_HLS_INDEX) {
 			ngx_log_error(NGX_LOG_ERR, log, 0,
-				"mp4mux: filelist parameter is only valid for fmt=dash/manifest.mpd");
+				"mp4mux: filelist parameter is only valid for playlists, fmt = %uD", ctx->fmt);
 			return NGX_HTTP_NOT_FOUND;
 		}
 		if ((rc = mp4mux_parse_filelist(ctx->req, ctx->mctx)) != NGX_OK)
 			return rc;
-		#if (NGX_HAVE_FILE_AIO)
-		ctx->aio_handler = mp4mux_dash_send_complex_manifest;
-		#endif
-		return mp4mux_dash_send_complex_manifest(ctx);
+		switch (ctx->fmt) {
+		case FMT_HLS_INDEX:
+			#if (NGX_HAVE_FILE_AIO)
+			ctx->aio_handler = mp4mux_hls_send_master;
+			#endif
+			return mp4mux_hls_send_master(ctx);
+		case FMT_DASH_MANIFEST:
+			#if (NGX_HAVE_FILE_AIO)
+			ctx->aio_handler = mp4mux_dash_send_complex_manifest;
+			#endif
+			return mp4mux_dash_send_complex_manifest(ctx);
+		}
 	}
 
 	ctx->trak_cnt = n;
@@ -1805,8 +1828,7 @@ static ngx_int_t mp4mux_send_response(ngx_http_mp4mux_ctx_t *ctx)
 	case FMT_MP4:          return mp4mux_send_mp4(ctx);
 	case FMT_HLS_INDEX:    return mp4mux_hls_send_index(ctx);
 	case FMT_HLS_SEGMENT:  return mp4mux_hls_send_segment(ctx);
-	case FMT_DASH_MANIFEST:
-		return mp4mux_dash_send_manifest(ctx);
+	case FMT_DASH_MANIFEST:return mp4mux_dash_send_manifest(ctx);
 	case FMT_DASH_INIT:    return mp4mux_dash_send_init(ctx);
 	case FMT_DASH_SEGMENT: return mp4mux_dash_send_segment(ctx);
 	}
@@ -2380,7 +2402,7 @@ static ngx_int_t mp4mux_hls_get_baseuri(ngx_http_request_t *r, ngx_http_variable
 	}
 	return NGX_OK;
 }
-static ngx_int_t mp4mux_dash_get_filename(ngx_http_request_t *r, ngx_http_variable_value_t *v, uintptr_t data)
+static ngx_int_t mp4mux_get_mp4_filename(ngx_http_request_t *r, ngx_http_variable_value_t *v, uintptr_t data)
 {
 	ngx_http_mp4mux_ctx_t *ctx = ngx_http_get_module_ctx(r, ngx_http_mp4mux_module);
 	mp4_file_t *f;
@@ -2658,6 +2680,148 @@ static ngx_int_t mp4mux_parse_filelist(ngx_http_request_t *r, mp4mux_manifest_ct
 	}
 	return NGX_OK;
 }
+static ngx_int_t mp4mux_hls_send_master(ngx_http_mp4mux_ctx_t *ctx)
+{
+	ngx_http_mp4mux_conf_t *conf;
+	ngx_http_request_t *r = ctx->req;
+	mp4mux_manifest_ctx_t *mctx = ctx->mctx;
+	mp4_file_t *f;
+	ngx_table_elt_t *content_disp;
+	ngx_int_t rc, j, content_len = sizeof(m3u8_master_header) + sizeof(m3u8_footer), len = 0;
+	ngx_str_t *urls;
+	ngx_uint_t i, trak_id = 0;
+	mp4_atom_avcC_t *avcc;
+	ngx_chain_t out;
+	ngx_list_part_t *part;
+	mp4mux_filegrp_t *fg;
+	bool_t again = 0;
+	
+	part = &mctx->list->part;
+	fg = part->elts;
+ 	for (i = 0;; i++) {
+ 		if (i >= part->nelts) {
+			if (part->next == NULL)
+				break;
+ 			part = part->next;
+			fg = part->elts;
+			i = 0;
+		}
+		for (j = 0; j < fg[i].n; j++) {
+			rc = mp4mux_open_file(fg[i].mp4[j]);
+			if (rc == NGX_AGAIN)
+				again = 1;
+			else if (rc != NGX_OK)
+				return rc;
+			len++;
+		}
+	}
+	if (again)
+		return NGX_AGAIN;
+	#if (NGX_HAVE_FILE_AIO)
+	ctx->aio_handler = NULL;
+	#endif
+
+	conf = ngx_http_get_module_loc_conf(r, ngx_http_mp4mux_module);
+	urls = ngx_palloc(r->pool, sizeof(ngx_str_t) * len);
+	len = 0;
+	part = &mctx->list->part;
+	fg = part->elts;
+ 	for (i = 0;; i++) {
+ 		if (i >= part->nelts) {
+			if (part->next == NULL)
+				break;
+ 			part = part->next;
+			fg = part->elts;
+			i = 0;
+		}
+		for (j = 0; j < fg[i].n; j++) {
+			f = fg[i].mp4[j];
+			ctx->mp4_src[0] = f;
+			if (!conf->mp_lengths || ngx_http_script_run(r, urls + trak_id, conf->mp_lengths->elts, 0, conf->mp_values->elts) == NULL) {
+				ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
+					"mp4mux: failed to run m3u8 entry script.");
+				return NGX_HTTP_INTERNAL_SERVER_ERROR;
+			}
+			if ((rc = mp4_validate_init(f)) != NGX_OK)
+				return rc;
+			rc = (uint64_t)f->sample_max * 1000 / f->timescale;
+			if (rc > len)
+				len = rc;
+			switch (fg[i].av) {
+				case 'v': content_len += sizeof(m3u8_master_video) + 5; break;
+				case 'a': content_len += sizeof(m3u8_master_audio) + fg[i].lang.len * 2; break;
+			}
+			content_len += urls[trak_id].len;
+			trak_id++;
+		}
+	}
+
+	if (!(out.buf = ngx_create_temp_buf(r->pool, content_len)))
+		return NGX_HTTP_INTERNAL_SERVER_ERROR;
+
+	out.next = NULL;
+	out.buf->last_buf = 1;
+	
+	ngx_memcpy(out.buf->start, m3u8_master_header, sizeof(m3u8_master_header) - 1);
+	out.buf->last = out.buf->start + sizeof(m3u8_master_header) - 1;
+
+	trak_id = 0;
+	part = &mctx->list->part;
+	fg = part->elts;
+	for (i = 0;; i++, trak_id++) {
+ 		if (i >= part->nelts) {
+			if (part->next == NULL)
+				break;
+ 			part = part->next;
+			fg = part->elts;
+			i = 0;
+		}
+		switch (fg[i].av) {
+		case 'v':
+			for (j = 0; j < fg[i].n; j++) {
+				f = fg[i].mp4[j];
+				if (f->sample_max == 0)
+					continue; // avoid division by zero
+				avcc = &f->trak.stsd->entry.avc1.avcC;
+				out.buf->last = ngx_sprintf(out.buf->last, m3u8_master_video,
+					(ngx_int_t)((uint64_t)f->file_size * 8 * f->timescale / f->sample_max),
+					avcc->prof_ind, avcc->prof_comp, avcc->level,
+					urls + trak_id);
+				mp4mux_release_cache_item(f, r->pool);
+			}
+			break;
+		case 'a':
+			for (j = 0; j < fg[i].n; j++) {
+				f = fg[i].mp4[j];
+				out.buf->last = ngx_sprintf(out.buf->last, m3u8_master_audio,
+					&fg[i].lang, &fg[i].lang, urls + trak_id);
+				mp4mux_release_cache_item(f, r->pool);
+			}
+			break;
+		}
+	}
+	ngx_memcpy(out.buf->last, m3u8_footer, sizeof(m3u8_footer) - 1);
+	out.buf->last += sizeof(m3u8_footer) - 1;
+	
+	// Output headers and data
+	r->headers_out.content_length_n = out.buf->last - out.buf->start;
+
+	r->headers_out.status = NGX_HTTP_OK;
+	ngx_str_set(&r->headers_out.content_type, "application/vnd.apple.mpegurl");
+	r->headers_out.content_type_len = r->headers_out.content_type.len;
+	if (!(content_disp = add_content_disp(r, 0)))
+		return NGX_HTTP_INTERNAL_SERVER_ERROR;
+	ngx_str_set(&content_disp->value, "inline; filename=\"master.m3u8\"");
+
+	rc = ngx_http_send_header(r);
+	if (rc == NGX_ERROR || rc > NGX_OK || r->header_only)
+		return rc;
+
+	rc = ngx_http_output_filter(r, &out);
+	if (rc != NGX_OK)
+		return rc;
+	return NGX_OK;
+}
 static ngx_int_t mp4mux_dash_send_complex_manifest(ngx_http_mp4mux_ctx_t *ctx)
 {
 	ngx_http_mp4mux_conf_t *conf;
@@ -2699,7 +2863,9 @@ static ngx_int_t mp4mux_dash_send_complex_manifest(ngx_http_mp4mux_ctx_t *ctx)
 	}
 	if (again)
 		return NGX_AGAIN;
+	#if (NGX_HAVE_FILE_AIO)
 	ctx->aio_handler = NULL;
+	#endif
 
 	part = &mctx->list->part;
 	fg = part->elts;
@@ -5179,7 +5345,7 @@ static mp4mux_cache_entry_t *mp4mux_cache_fetch(mp4_file_t *file)
 }
 // Nginx config
 static ngx_str_t hls_baseuri_var = ngx_string("hls_baseuri");
-static ngx_str_t dash_filename_var = ngx_string("dash_filename");
+static ngx_str_t mp4_filename_var = ngx_string("mp4_filename");
 static ngx_int_t ngx_http_mp4mux_add_variables(ngx_conf_t *cf)
 {
 	ngx_http_variable_t  *var;
@@ -5188,9 +5354,9 @@ static ngx_int_t ngx_http_mp4mux_add_variables(ngx_conf_t *cf)
 	if (!var) return NGX_ERROR;
 	var->get_handler = mp4mux_hls_get_baseuri;
 
-	var = ngx_http_add_variable(cf, &dash_filename_var, 0);
+	var = ngx_http_add_variable(cf, &mp4_filename_var, 0);
 	if (!var) return NGX_ERROR;
-	var->get_handler = mp4mux_dash_get_filename;
+	var->get_handler = mp4mux_get_mp4_filename;
 
 	return NGX_OK;
 }
@@ -5293,7 +5459,8 @@ static char *ngx_http_mp4mux_merge_conf(ngx_conf_t *cf, void *parent, void *chil
 	ngx_conf_merge_msec_value(conf->segment_ms, prev->segment_ms, 10000);
 	ngx_conf_merge_value(conf->chunk_rate, prev->chunk_rate, 10);
 	ngx_conf_merge_str_value(conf->hls_prefix,  prev->hls_prefix,  "$scheme://$http_host$hls_baseuri&fmt=hls/");
-	ngx_conf_merge_str_value(conf->dash_prefix, prev->dash_prefix, "$scheme://$http_host$uri?file0=$dash_filename&fmt=dash/");
+	ngx_conf_merge_str_value(conf->hls_master_item,  prev->hls_master_item,  "$scheme://$http_host$uri?file0=$mp4_filename&fmt=hls/index.m3u8");
+	ngx_conf_merge_str_value(conf->dash_prefix, prev->dash_prefix, "$scheme://$http_host$uri?file0=$mp4_filename&fmt=dash/");
 	ngx_conf_merge_str_value(conf->allow_origin, prev->allow_origin, "");
 
 	ngx_memzero(&sc, sizeof(ngx_http_script_compile_t));
@@ -5305,6 +5472,14 @@ static char *ngx_http_mp4mux_merge_conf(ngx_conf_t *cf, void *parent, void *chil
 	sc.source = &conf->hls_prefix;
 	sc.lengths = &conf->hp_lengths;
 	sc.values = &conf->hp_values;
+	sc.variables = ngx_http_script_variables_count(sc.source);
+
+	if (sc.variables && ngx_http_script_compile(&sc) != NGX_OK)
+		return NGX_CONF_ERROR;
+
+	sc.source = &conf->hls_master_item;
+	sc.lengths = &conf->mp_lengths;
+	sc.values = &conf->mp_values;
 	sc.variables = ngx_http_script_variables_count(sc.source);
 
 	if (sc.variables && ngx_http_script_compile(&sc) != NGX_OK)
