@@ -760,7 +760,7 @@ ngx_module_t  ngx_http_mp4mux_module = {
 	NGX_MODULE_V1_PADDING
 };
 
-u_char* parseint(u_char *str, u_char *end, ngx_int_t *result)
+static u_char* parseint(u_char *str, u_char *end, ngx_int_t *result)
 {
 	*result = 0;
 	while (str < end && *str >= '0' && *str <= '9')
@@ -768,14 +768,14 @@ u_char* parseint(u_char *str, u_char *end, ngx_int_t *result)
 	return str;
 }
 
-ngx_int_t intlen(ngx_int_t i)
+static ngx_int_t intlen(ngx_int_t i)
 {
 	ngx_int_t x = 1;
 	if (i < 0) {
 		x++;
 		x = -x;
 	}
-	while (i > 10) {
+	while (i >= 10) {
 		x++;
 		i /= 10;
 	}
