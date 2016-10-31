@@ -3301,7 +3301,7 @@ static ngx_int_t mp4_stsc_ptr_advance_entry(mp4_stsc_ptr_t *ptr) {
 		}
 		ptr->samp_cnt = be32toh(ptr->entry++->sample_cnt);
 		if (ptr->entry == ptr->end)
-			ptr->next = ptr->chunk_count;
+			ptr->next = ptr->chunk_count + 1;
 		else
 			ptr->next = be32toh(ptr->entry->first_chunk);
 	}
