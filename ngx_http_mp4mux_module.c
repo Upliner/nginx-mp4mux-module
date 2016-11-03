@@ -1792,8 +1792,8 @@ static ngx_int_t mp4mux_send_response(ngx_http_mp4mux_ctx_t *ctx)
 
 	hdr->hash = 1;
 	ngx_str_set(&hdr->key, "ETag");
-	hdr->value.len = 32;
-	if (!(hdr->value.data = ngx_palloc(r->pool, 32)))
+	hdr->value.len = 34;
+	if (!(hdr->value.data = ngx_palloc(r->pool, 34)))
 		return NGX_HTTP_INTERNAL_SERVER_ERROR;
 	
 	ngx_md5_init(&etag_md5);
@@ -1811,7 +1811,9 @@ static ngx_int_t mp4mux_send_response(ngx_http_mp4mux_ctx_t *ctx)
 		ngx_md5_update(&etag_md5, &ctx->mp4_src[i]->file_size, sizeof(size_t));
 	}
 	ngx_md5_final(md5_result, &etag_md5);
-	ngx_hex_dump(hdr->value.data, md5_result, 16);
+	ngx_hex_dump(hdr->value.data + 1, md5_result, 16);
+	hdr->value.data[0] = '"';
+	hdr->value.data[33] = '"';
 	r->headers_out.etag = hdr;
 
 	// Call format-specific functions
