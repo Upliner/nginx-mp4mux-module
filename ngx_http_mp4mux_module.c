@@ -795,7 +795,6 @@ ngx_http_mp4mux_handler(ngx_http_request_t *r)
 	ngx_str_t fname;
 	ngx_http_mp4mux_conf_t   *conf;
 	ngx_log_t *log = r->connection->log;
-	ngx_http_range_filter_ctx_t *rangectx;
 	ngx_http_cleanup_t *cln;
 	u_char *p;
 
@@ -812,13 +811,6 @@ ngx_http_mp4mux_handler(ngx_http_request_t *r)
 
 	if (rc != NGX_OK)
 		return rc;
-
-	rangectx = ngx_http_get_module_ctx(r, ngx_http_range_body_filter_module);
-	if (rangectx != NULL && rangectx->ranges.nelts != 1) {
-		ngx_log_error(NGX_LOG_ERR, log, 0,
-			"mp4mux: requests with multiple ranges are not supported", &value);
-		return NGX_HTTP_BAD_REQUEST;
-	}
 
 	conf = ngx_http_get_module_loc_conf(r, ngx_http_mp4mux_module);
 
@@ -998,6 +990,7 @@ ngx_http_mp4mux_handler(ngx_http_request_t *r)
 	}
 
 	r->allow_ranges = 1;
+	r->single_range = 1;
 
 	if (ctx->start) {
 			ngx_log_error(NGX_LOG_ERR, log, 0,
